@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: build and release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: set up go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: build linux/amd64
+        run: |
+          cd src
+          GOOS=linux GOARCH=amd64 go build -trimpath -o ../keep-linux-amd64 .
+
+      - name: build linux/arm64
+        run: |
+          cd src
+          GOOS=linux GOARCH=arm64 go build -trimpath -o ../keep-linux-arm64 .
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            keep-linux-amd64
+            keep-linux-arm64
+          generate_release_notes: true
