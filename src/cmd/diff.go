@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,12 +12,12 @@ import (
 )
 
 var diffCmd = &cobra.Command{
-	Use:   "diff <file|dir>...",
+	Use:   "diff [file|dir]...",
 	Short: "Show differences between live files and stored versions",
 	Long: `Show a line-by-line diff between each live file and its stored version.
-For directories, all differing files are shown. Paths are resolved relative
-to your current working directory.`,
-	Args: cobra.MinimumNArgs(1),
+For directories, all differing files are shown. With no arguments, diffs
+everything in the storage directory that differs from live.
+Paths are resolved relative to your current working directory.`,
 	RunE: runDiff,
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return nil, cobra.ShellCompDirectiveDefault
@@ -27,16 +28,16 @@ func init() {
 	rootCmd.AddCommand(diffCmd)
 }
 
-func diffFiles(liveFile, storeFile, label string) {
-	// check identical first
+func diffPair(liveFile, storeFile, label string) string {
 	liveHash, err1 := hashFile(liveFile)
 	storeHash, err2 := hashFile(storeFile)
 	if err1 == nil && err2 == nil && string(liveHash) == string(storeHash) {
-		return // skip identical files silently in directory mode
+		return ""
 	}
 
-	fmt.Printf("\n%s  %s\n", yellow("~"), bold(label))
-	fmt.Printf("%s\n", dim(strings.Repeat("─", 60)))
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("\n%s  %s\n", yellow("~"), bold(label)))
+	buf.WriteString(fmt.Sprintf("%s\n", dim(strings.Repeat("─", 60))))
 
 	cmd := exec.Command("diff",
 		"--color=always",
@@ -45,102 +46,150 @@ func diffFiles(liveFile, storeFile, label string) {
 		"--label", "live",
 		storeFile, liveFile,
 	)
-	cmd.Stdout = os.Stdout
+	var out bytes.Buffer
+	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
-	cmd.Run() // exits 1 when files differ — expected, ignore error
+	cmd.Run()
+	buf.Write(out.Bytes())
+	return buf.String()
+}
+
+func outputWithPager(output string) {
+	lines := strings.Count(output, "\n")
+	rows := termRows()
+
+	if lines <= rows {
+		fmt.Print(output)
+		return
+	}
+
+	pager := exec.Command("less", "-R")
+	pager.Stdin = strings.NewReader(output)
+	pager.Stdout = os.Stdout
+	pager.Stderr = os.Stderr
+	if err := pager.Run(); err != nil {
+		fmt.Print(output)
+	}
+}
+
+func termRows() int {
+	cmd := exec.Command("tput", "lines")
+	cmd.Stdin = os.Stdin
+	out, err := cmd.Output()
+	if err != nil {
+		return 40
+	}
+	var rows int
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &rows)
+	if rows <= 0 {
+		return 40
+	}
+	return rows
+}
+
+// diffTarget returns diff output for a single target, empty string if identical
+func diffTarget(abs, storePath, rel string) string {
+	var buf bytes.Buffer
+
+	liveInfo, liveErr := os.Stat(abs)
+	if os.IsNotExist(liveErr) {
+		buf.WriteString(fmt.Sprintf("%s  live path not found: ~/%s\n", red("✗"), rel))
+		return buf.String()
+	}
+	if _, err := os.Stat(storePath); os.IsNotExist(err) {
+		buf.WriteString(fmt.Sprintf("%s  not in storage: %s\n", red("✗"), rel))
+		return buf.String()
+	}
+
+	if liveInfo.IsDir() {
+		// files in store — check against live
+		filepath.Walk(storePath, func(sp string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			fileRel, _ := filepath.Rel(storePath, sp)
+			liveFile := filepath.Join(abs, fileRel)
+			displayLabel := "~/" + rel + "/" + fileRel
+
+			if _, err := os.Stat(liveFile); os.IsNotExist(err) {
+				buf.WriteString(fmt.Sprintf("\n%s  %s  %s\n", red("-"), bold(displayLabel), dim("(missing from live)")))
+				return nil
+			}
+			buf.WriteString(diffPair(liveFile, sp, displayLabel))
+			return nil
+		})
+
+		// files in live not in store
+		filepath.Walk(abs, func(lp string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			fileRel, _ := filepath.Rel(abs, lp)
+			sp := filepath.Join(storePath, fileRel)
+			displayLabel := "~/" + rel + "/" + fileRel
+			if _, err := os.Stat(sp); os.IsNotExist(err) {
+				buf.WriteString(fmt.Sprintf("\n%s  %s  %s\n", green("+"), bold(displayLabel), dim("(not in storage)")))
+			}
+			return nil
+		})
+	} else {
+		buf.WriteString(diffPair(abs, storePath, "~/"+rel))
+	}
+
+	return buf.String()
 }
 
 func runDiff(cmd *cobra.Command, args []string) error {
 	home, _ := os.UserHomeDir()
 	store := resolvedStoreDir()
 
-	for _, target := range args {
-		abs, err := filepath.Abs(target)
-		if err != nil {
-			errorf("cannot resolve %s: %v", target, err)
-			continue
+	var output strings.Builder
+
+	if len(args) == 0 {
+		if _, err := os.Stat(store); os.IsNotExist(err) {
+			errorf("storage directory not found: %s", store)
+			return nil
 		}
-
-		if !strings.HasPrefix(abs, home+string(filepath.Separator)) {
-			errorf("%s is outside $HOME", abs)
-			continue
-		}
-
-		rel := strings.TrimPrefix(abs, home+string(filepath.Separator))
-		storePath := filepath.Join(store, rel)
-
-		liveInfo, liveErr := os.Stat(abs)
-		if os.IsNotExist(liveErr) {
-			errorf("live path not found: ~/%s", rel)
-			continue
-		}
-		if _, err := os.Stat(storePath); os.IsNotExist(err) {
-			errorf("not in storage: %s", rel)
-			continue
-		}
-
-		if liveInfo.IsDir() {
-			// walk the store side, diff each file against live
-			any := false
-			err := filepath.Walk(storePath, func(sp string, info os.FileInfo, err error) error {
-				if err != nil || info.IsDir() {
-					return nil
-				}
-				fileRel, _ := filepath.Rel(storePath, sp)
-				liveFile := filepath.Join(abs, fileRel)
-				displayLabel := "~/" + rel + "/" + fileRel
-
-				if _, err := os.Stat(liveFile); os.IsNotExist(err) {
-					fmt.Printf("\n%s  %s  %s\n", red("-"), bold(displayLabel), dim("(missing from live)"))
-					any = true
-					return nil
-				}
-
-				liveHash, err1 := hashFile(liveFile)
-				storeHash, err2 := hashFile(sp)
-				if err1 != nil || err2 != nil {
-					return nil
-				}
-				if string(liveHash) != string(storeHash) {
-					diffFiles(liveFile, sp, displayLabel)
-					any = true
-				}
-				return nil
-			})
+		filepath.Walk(store, func(storePath string, info os.FileInfo, err error) error {
 			if err != nil {
-				errorf("error walking %s: %v", target, err)
-				continue
+				return nil
 			}
-
-			// also check for files in live that aren't in the store
-			filepath.Walk(abs, func(lp string, info os.FileInfo, err error) error {
-				if err != nil || info.IsDir() {
-					return nil
-				}
-				fileRel, _ := filepath.Rel(abs, lp)
-				sp := filepath.Join(storePath, fileRel)
-				displayLabel := "~/" + rel + "/" + fileRel
-				if _, err := os.Stat(sp); os.IsNotExist(err) {
-					fmt.Printf("\n%s  %s  %s\n", green("+"), bold(displayLabel), dim("(not in storage)"))
-					any = true
+			rel, _ := filepath.Rel(store, storePath)
+			if rel == "." || isIgnored(rel) {
+				if info.IsDir() && rel != "." {
+					return filepath.SkipDir
 				}
 				return nil
-			})
-
-			if !any {
-				fmt.Printf("%s  %s  %s\n", green("="), bold("~/"+rel+"/"), dim("(identical)"))
 			}
-		} else {
-			// single file
-			liveHash, err1 := hashFile(abs)
-			storeHash, err2 := hashFile(storePath)
-			if err1 == nil && err2 == nil && string(liveHash) == string(storeHash) {
-				fmt.Printf("%s  %s  %s\n", green("="), bold("~/"+rel), dim("(identical)"))
+			if info.IsDir() {
+				return nil
+			}
+			livePath := filepath.Join(home, rel)
+			output.WriteString(diffTarget(livePath, storePath, rel))
+			return nil
+		})
+	} else {
+		for _, target := range args {
+			abs, err := filepath.Abs(target)
+			if err != nil {
+				errorf("cannot resolve %s: %v", target, err)
 				continue
 			}
-			diffFiles(abs, storePath, "~/"+rel)
+			if !strings.HasPrefix(abs, home+string(filepath.Separator)) {
+				errorf("%s is outside $HOME", abs)
+				continue
+			}
+			rel := strings.TrimPrefix(abs, home+string(filepath.Separator))
+			storePath := filepath.Join(store, rel)
+			output.WriteString(diffTarget(abs, storePath, rel))
 		}
 	}
 
+	result := output.String()
+	if strings.TrimSpace(result) == "" {
+		fmt.Printf("%s  %s\n", green("="), dim("everything identical"))
+		return nil
+	}
+	outputWithPager(result)
 	return nil
 }

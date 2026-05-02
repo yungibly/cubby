@@ -1,2 +1,4 @@
 keep
 pkg/
+keep-*.pkg.tar.zst
+keep-debug-*.pkg.tar.zst
