@@ -53,7 +53,6 @@ func diffFiles(liveFile, storeFile, label string) {
 func runDiff(cmd *cobra.Command, args []string) error {
 	home, _ := os.UserHomeDir()
 	store := resolvedStoreDir()
-	cwd, _ := os.Getwd()
 
 	for _, target := range args {
 		abs, err := filepath.Abs(target)
