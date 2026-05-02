@@ -56,7 +56,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	cwd, _ := os.Getwd()
 
 	for _, target := range args {
-		abs, err := filepath.Abs(filepath.Join(cwd, target))
+		abs, err := filepath.Abs(target)
 		if err != nil {
 			errorf("cannot resolve %s: %v", target, err)
 			continue
