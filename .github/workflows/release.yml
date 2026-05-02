@@ -35,4 +35,4 @@ jobs:
           files: |
             keep-linux-amd64
             keep-linux-arm64
-          generate_release_notes: true
+          
