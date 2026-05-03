@@ -1,4 +1,4 @@
-module dotconfig
+module cubby
 
 go 1.22
 

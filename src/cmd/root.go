@@ -43,17 +43,17 @@ var (
 // ── root command ───────────────────────────────────────────────────────────────
 
 var rootCmd = &cobra.Command{
-	Use:   "keep <file|dir>...",
+	Use:   "cubby <file|dir>...",
 	Short: "Sync files to your storage directory",
-	Long: `keep syncs files and directories from your home directory into a
+	Long: `cubby syncs files and directories from your home directory into a
 mirrored structure inside your storage directory (~/.mydots by default),
 preserving the full path relative to $HOME.
 
-The storage directory can be configured in ~/.config/keep/config.toml:
+The storage directory can be configured in ~/.config/cubby/config.toml:
 
   store = "~/.mydots"
 
-Use "keep help <command>" for help on a specific command.`,
+Use "cubby help <command>" for help on a specific command.`,
 	Args:              cobra.MinimumNArgs(1),
 	RunE:              runSync,
 	DisableFlagParsing: false,
@@ -85,7 +85,7 @@ func init() {
 
 func initConfig() {
 	home, _ := os.UserHomeDir()
-	viper.AddConfigPath(filepath.Join(home, ".config", "keep"))
+	viper.AddConfigPath(filepath.Join(home, ".config", "cubby"))
 	viper.SetConfigName("config")
 	viper.SetConfigType("toml")
 	viper.SetDefault("store", "~/.mydots")

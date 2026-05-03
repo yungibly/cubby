@@ -18,7 +18,7 @@ var saveCmd = &cobra.Command{
 	Short: "Sync all modified live files to the storage directory",
 	Long: `Sync every file that differs between the live system and the storage
 directory, updating stored versions with live ones.
-The natural opposite of keep reset.
+The natural opposite of cubby reset.
 
 Use --dry-run to preview what would be synced without making changes.`,
 	RunE: runSave,

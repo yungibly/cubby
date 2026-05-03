@@ -125,9 +125,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			direction := ""
 			if liveInfo != nil && storeInfo != nil {
 				if liveInfo.ModTime().After(storeInfo.ModTime()) {
-					direction = dim("  live is newer — run: keep " + e.rel)
+					direction = dim("  live is newer — run: cubby " + e.rel)
 				} else {
-					direction = dim("  store is newer — run: keep restore " + e.rel)
+					direction = dim("  store is newer — run: cubby restore " + e.rel)
 				}
 			}
 			fmt.Printf("  %s  %s%s\n", yellow("~"), e.rel, direction)
@@ -145,7 +145,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  %s  %s%s  %s\n",
 				red("-"),
 				e.rel, suffix,
-				dim("run: keep restore "+e.rel),
+				dim("run: cubby restore "+e.rel),
 			)
 		}
 	}

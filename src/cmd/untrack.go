@@ -15,8 +15,8 @@ var untrackCmd = &cobra.Command{
 	Use:   "untrack <file|dir>...",
 	Short: "Remove files from the storage directory",
 	Long: `Remove files or directories from the storage directory.
-Untracked files are moved to ~/.local/share/keep/untracked/ rather than
-deleted, preserving the same path structure. To retrack, simply run keep
+Untracked files are moved to ~/.local/share/cubby/untracked/ rather than
+deleted, preserving the same path structure. To retrack, simply run cubby
 on the live file again.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runUntrack,
@@ -32,7 +32,7 @@ func init() {
 
 func untrackDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "keep", "untracked")
+	return filepath.Join(home, ".local", "share", "cubby", "untracked")
 }
 
 func runUntrack(cmd *cobra.Command, args []string) error {
@@ -83,7 +83,7 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s  %s  %s\n",
 			yellow("↗"),
 			bold(rel),
-			dim("→  ~/.local/share/keep/untracked/"+rel),
+			dim("→  ~/.local/share/cubby/untracked/"+rel),
 		)
 		logEntry("untrack", rel)
 	}

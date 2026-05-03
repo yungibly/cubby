@@ -9,16 +9,16 @@ import (
 var completionCmd = &cobra.Command{
 	Use:   "completion [bash|zsh|fish]",
 	Short: "Generate shell completion script",
-	Long: `Generate a shell completion script for keep.
+	Long: `Generate a shell completion script for cubby.
 
 Bash:
-  keep completion bash > /etc/bash_completion.d/keep
+  cubby completion bash > /etc/bash_completion.d/cubby
 
 Zsh:
-  keep completion zsh > "${fpath[1]}/_keep"
+  cubby completion zsh > "${fpath[1]}/_cubby"
 
 Fish:
-  keep completion fish > ~/.config/fish/completions/keep.fish
+  cubby completion fish > ~/.config/fish/completions/cubby.fish
 `,
 	Args:      cobra.ExactArgs(1),
 	ValidArgs: []string{"bash", "zsh", "fish"},

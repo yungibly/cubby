@@ -34,7 +34,7 @@ func init() {
 
 func logPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "keep", "history.log")
+	return filepath.Join(home, ".local", "share", "cubby", "history.log")
 }
 
 func logEntry(op, rel string) {
