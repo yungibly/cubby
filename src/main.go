@@ -1,6 +1,6 @@
 package main
 
-import "dotconfig/cmd"
+import "cubby/cmd"
 
 func main() {
 	cmd.Execute()
