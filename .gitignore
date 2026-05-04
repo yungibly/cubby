@@ -1,4 +1,4 @@
-keep
+cubby
 pkg/
-keep-*.pkg.tar.zst
-keep-debug-*.pkg.tar.zst
+cubby-*.pkg.tar.zst
+cubby-debug-*.pkg.tar.zst
