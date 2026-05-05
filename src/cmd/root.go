@@ -36,25 +36,29 @@ func bold(s string) string   { return colorBold + s + colorReset }
 // ── flags ──────────────────────────────────────────────────────────────────────
 
 var (
-	dryRun bool
-	debug  bool
+	syncDryRun bool
+	debug      bool
+	syncYes    bool
 )
 
 // ── root command ───────────────────────────────────────────────────────────────
 
 var rootCmd = &cobra.Command{
-	Use:   "cubby <file|dir>...",
+	Use:   "cubby [file|dir]...",
 	Short: "Sync files to your storage directory",
 	Long: `cubby syncs files and directories from your home directory into a
 mirrored structure inside your storage directory (~/.mydots by default),
 preserving the full path relative to $HOME.
+
+If no arguments are provided, cubby will scan all tracked files and save
+any that have changed in your home directory back to the storage directory.
 
 The storage directory can be configured in ~/.config/cubby/config.toml:
 
   store = "~/.mydots"
 
 Use "cubby help <command>" for help on a specific command.`,
-	Args:              cobra.MinimumNArgs(1),
+	Args:              cobra.ArbitraryArgs,
 	RunE:              runSync,
 	DisableFlagParsing: false,
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -72,7 +76,8 @@ func init() {
 	cobra.OnInitialize(initConfig)
 
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "show debug information")
-	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "simulate without making changes")
+	rootCmd.Flags().BoolVarP(&syncDryRun, "dry-run", "n", false, "simulate without making changes")
+	rootCmd.Flags().BoolVarP(&syncYes, "yes", "y", false, "skip confirmation prompt")
 
 	// hide flags we don't want cluttering help output
 	rootCmd.PersistentFlags().MarkHidden("debug")
@@ -85,7 +90,28 @@ func init() {
 
 func initConfig() {
 	home, _ := os.UserHomeDir()
-	viper.AddConfigPath(filepath.Join(home, ".config", "cubby"))
+	configDir := filepath.Join(home, ".config", "cubby")
+	configFile := filepath.Join(configDir, "config.toml")
+
+	// ensure config directory exists
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(configDir, 0755); err != nil {
+			debugf("failed to create config directory: %v", err)
+		}
+	}
+
+	// create default config if it doesn't exist
+	if _, err := os.Stat(configFile); os.IsNotExist(err) {
+		defaultConfig := `store = "~/.mydots"
+`
+		if err := os.WriteFile(configFile, []byte(defaultConfig), 0644); err != nil {
+			debugf("failed to write default config: %v", err)
+		} else {
+			fmt.Printf("%s  %s\n", green("i"), dim("created default config at "+configFile))
+		}
+	}
+
+	viper.AddConfigPath(configDir)
 	viper.SetConfigName("config")
 	viper.SetConfigType("toml")
 	viper.SetDefault("store", "~/.mydots")
@@ -255,6 +281,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	cwd, _ := os.Getwd()
 	debugf("home=%s store=%s cwd=%s", home, store, cwd)
 
+	if len(args) == 0 {
+		return runSaveAll(home, store)
+	}
+
 	for _, target := range args {
 		abs, err := filepath.Abs(target)
 		if err != nil {
@@ -279,7 +309,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 
 		if info.IsDir() {
-			if dryRun {
+			if syncDryRun {
 				printDryRunHeader("~/"+rel, store+"/"+rel)
 				syncDir(abs, dst, true)
 				continue
@@ -293,7 +323,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 				continue
 			}
 		} else {
-			if dryRun {
+			if syncDryRun {
 				printDryRunHeader("~/"+rel, store+"/"+rel)
 				dryRunFile(abs, dst)
 				continue
@@ -311,6 +341,107 @@ func runSync(cmd *cobra.Command, args []string) error {
 		printSync(rel, store)
 		logEntry("sync", rel)
 	}
+
+	return nil
+}
+
+func runSaveAll(home, store string) error {
+	if _, err := os.Stat(store); os.IsNotExist(err) {
+		errorf("storage directory not found: %s", store)
+		return nil
+	}
+
+	var toSave []statusEntry
+
+	err := filepath.Walk(store, func(storePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		rel, _ := filepath.Rel(store, storePath)
+		if rel == "." || isIgnored(rel) {
+			if info.IsDir() && rel != "." {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		livePath := filepath.Join(home, rel)
+		if _, err := os.Stat(livePath); os.IsNotExist(err) {
+			// missing from live — skip, that's restore's territory
+			return nil
+		}
+
+		storeHash, err1 := hashFile(storePath)
+		liveHash, err2 := hashFile(livePath)
+		if err1 != nil || err2 != nil {
+			debugf("could not hash %s", rel)
+			return nil
+		}
+
+		if string(storeHash) != string(liveHash) {
+			toSave = append(toSave, statusEntry{rel: rel, status: statusModified})
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		errorf("error walking storage directory: %v", err)
+		return nil
+	}
+
+	if len(toSave) == 0 {
+		fmt.Printf("%s  %s\n", green("✓"), dim("everything in sync, nothing to save"))
+		return nil
+	}
+
+	// preview
+	fmt.Printf("\n%s\n", bold("files to save:"))
+	for _, e := range toSave {
+		fmt.Printf("  %s  %s\n", green("✓"), e.rel)
+	}
+	fmt.Println()
+
+	if syncDryRun {
+		fmt.Printf("%s\n", dim(fmt.Sprintf("%d files would be saved", len(toSave))))
+		return nil
+	}
+
+	if !syncYes {
+		if !confirm(fmt.Sprintf("save %d files to storage?", len(toSave))) {
+			fmt.Println(dim("aborted."))
+			return nil
+		}
+	}
+
+	errors := 0
+	for _, e := range toSave {
+		src := filepath.Join(home, e.rel)
+		dst := filepath.Join(store, e.rel)
+
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			errorf("could not create directory for %s: %v", e.rel, err)
+			errors++
+			continue
+		}
+		if err := copyFile(src, dst); err != nil {
+			errorf("save failed for %s: %v", e.rel, err)
+			errors++
+			continue
+		}
+		printSync(e.rel, store)
+		logEntry("sync", e.rel)
+	}
+
+	fmt.Printf("\n%s\n", dim(fmt.Sprintf(
+		"%d saved  ·  %d errors",
+		len(toSave)-errors, errors,
+	)))
 
 	return nil
 }
