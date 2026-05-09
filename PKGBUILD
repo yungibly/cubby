@@ -1,6 +1,6 @@
 # Maintainer: you
 pkgname=cubby
-pkgver=1.0.5
+pkgver=1.0.6
 pkgrel=1
 pkgdesc="File sync and storage tool — mirror files to a versioned storage directory"
 arch=('x86_64' 'aarch64')

@@ -41,15 +41,14 @@ func init() {
 func runRestore(cmd *cobra.Command, args []string) error {
 	home, _ := os.UserHomeDir()
 	store := resolvedStoreDir()
-	cwd, _ := os.Getwd()
-	debugf("home=%s store=%s cwd=%s", home, store, cwd)
+	debugf("home=%s store=%s cwd=%s", home, store)
 
 	if len(args) == 0 {
 		return runRestoreAll(home, store)
 	}
 
 	for _, target := range args {
-		abs, err := filepath.Abs(filepath.Join(cwd, target))
+		abs, err := filepath.Abs(target)
 		if err != nil {
 			errorf("cannot resolve %s: %v", target, err)
 			continue
