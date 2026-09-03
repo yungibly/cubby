@@ -14,7 +14,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -42,7 +42,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -58,7 +58,7 @@ jobs:
         run: cargo test --release --locked --target ${{ matrix.target }}
       - name: package
         run: scripts/package.sh "${{ needs.check.outputs.version }}" "${{ matrix.target }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/*.tar.gz
@@ -71,7 +71,7 @@ jobs:
     outputs:
       checksums: ${{ steps.sums.outputs.checksums }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -85,7 +85,7 @@ jobs:
             cat checksums.txt
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
@@ -97,8 +97,8 @@ jobs:
     needs: [check, release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           repository: yungibly/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
