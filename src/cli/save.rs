@@ -66,10 +66,15 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     };
 
     let scan = ctx.scanner().scan(&scope)?;
-    let plan = plan::plan(&scan, Direction::Save, force);
+    let plan = plan::plan(&scan, &ctx.cfg.layout, Direction::Save, force);
 
-    for (rel, why) in &scan.notes {
-        ctx.warn(&format!("{rel}: {why}"));
+    for n in &scan.notes {
+        ctx.warn(&format!("{}: {}", n.path, n.why));
+    }
+    for dir in &scan.empty_dirs {
+        ctx.warn(&format!(
+            "{dir} exists at home but has no files; leaving its store copy alone (run `cubby untrack {dir}` if that was deliberate)"
+        ));
     }
     if scope.is_all() {
         for dir in &scan.absent_dirs {
@@ -98,14 +103,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
 
     let copies = plan.count(Op::Create) + plan.count(Op::Overwrite);
     let removals = plan.count(Op::Remove);
-    let bytes: u64 = plan
-        .actions
-        .iter()
-        .filter(|a| a.op != Op::Remove)
-        .filter_map(|a| scan.entries.iter().find(|e| e.rel == a.rel))
-        .filter_map(|e| e.home.as_ref())
-        .map(|m| m.len)
-        .sum();
+    let bytes = plan::bytes_to_copy(&plan, &scan);
     let mut summary = format!(
         "{} ({})",
         ui::plural(copies, "file to copy", "files to copy"),

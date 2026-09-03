@@ -748,3 +748,186 @@ fn completion_and_version() {
     assert!(text.contains("restore"), "{text}");
     assert!(!text.contains("completion"), "hidden: {text}");
 }
+
+#[test]
+fn empty_tracked_directory_is_treated_as_absent() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.write_home(".config/app/b.conf", "b\n");
+    sb.ok(&["~/.config/app", "-y"]);
+    // An unmounted volume or a wiped config leaves the directory in place but empty.
+    fs::remove_file(sb.home_path(".config/app/a.conf")).unwrap();
+    fs::remove_file(sb.home_path(".config/app/b.conf")).unwrap();
+
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("nothing to save"), "{text}");
+    assert!(
+        text.contains("~/.config/app exists at home but has no files"),
+        "{text}"
+    );
+    assert!(sb.store_path(".config/app/a.conf").exists());
+    assert!(sb.store_path(".config/app/b.conf").exists());
+
+    let text = sb.ok(&["status"]);
+    assert!(
+        text.contains("tracked directory, empty at home; store copy kept"),
+        "{text}"
+    );
+    assert!(!text.contains("deleted at home"), "{text}");
+
+    // Deleting some files is still mirrored; only a completely empty directory is suspect.
+    sb.write_home(".config/app/a.conf", "a\n");
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("- .config/app/b.conf"), "{text}");
+    assert!(!sb.store_path(".config/app/b.conf").exists());
+    assert!(sb.store_path(".config/app/a.conf").exists());
+
+    // Restore still brings everything back into an empty directory.
+    fs::remove_file(sb.home_path(".config/app/a.conf")).unwrap();
+    let text = sb.ok(&["restore", "-y"]);
+    assert!(text.contains("+ .config/app/a.conf"), "{text}");
+}
+
+#[test]
+fn paths_are_tracked_as_typed_through_symlinked_parents() {
+    let sb = Sandbox::ready();
+    sb.write_home("Dropbox/myapp/sub/a.conf", "a\n");
+    std::os::unix::fs::symlink("Dropbox/myapp", sb.home_path(".myapp")).unwrap();
+
+    let text = sb.ok(&["~/.myapp/sub", "-y"]);
+    assert!(
+        text.contains("tracking ~/.myapp/sub as a directory"),
+        "{text}"
+    );
+    assert!(text.contains("+ .myapp/sub/a.conf"), "{text}");
+    assert!(sb.store_path(".myapp/sub/a.conf").exists());
+    assert!(!sb.store_path("Dropbox").exists());
+
+    // Round trip through the same typed path, and a lone file through the link.
+    sb.write_home("Dropbox/myapp/sub/a.conf", "edited\n");
+    sb.write_home("Dropbox/myapp/top.conf", "t\n");
+    sb.ok(&["~/.myapp/top.conf", "-y"]);
+    assert!(sb.store_path(".myapp/top.conf").exists());
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("~ .myapp/sub/a.conf"), "{text}");
+    sb.ok(&["restore", "-y", "~/.myapp/sub"]);
+    // A restore over the symlinked path lands in the real directory.
+    sb.write_store(".myapp/sub/a.conf", "from store\n");
+    sb.ok(&["restore", "-y", "~/.myapp/sub/a.conf"]);
+    assert_eq!(sb.read_home("Dropbox/myapp/sub/a.conf"), "from store\n");
+
+    // The real location is still what the store check looks at.
+    std::os::unix::fs::symlink(".dotfiles", sb.home_path("dots")).unwrap();
+    let text = sb.fail(&["~/dots/.myapp/top.conf", "-y"]);
+    assert!(text.contains("inside the store"), "{text}");
+    std::os::unix::fs::symlink("dots/.myapp/top.conf", sb.home_path(".linked")).unwrap();
+    let text = sb.fail(&["~/.linked", "-y"]);
+    assert!(text.contains("symlink into the store"), "{text}");
+    assert!(!sb.store_path(".linked").exists());
+}
+
+#[test]
+fn unreadable_files_are_errors_not_new() {
+    if unsafe { libc_geteuid() } == 0 {
+        return; // root can read anything
+    }
+    let sb = Sandbox::ready();
+    sb.write_home(".config/app/ok.conf", "ok\n");
+    sb.ok(&["~/.config/app", "-y"]);
+    sb.write_home(".config/app/secret", "s\n");
+    fs::set_permissions(
+        sb.home_path(".config/app/secret"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("errors\n  ! .config/app/secret"), "{text}");
+    assert!(text.contains("cannot read"), "{text}");
+    assert!(!text.contains("new at home"), "{text}");
+
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("nothing to save"), "{text}");
+    assert!(text.contains("! .config/app/secret"), "{text}");
+    assert!(!sb.store_path(".config/app/secret").exists());
+    fs::set_permissions(
+        sb.home_path(".config/app/secret"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+}
+
+unsafe extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+}
+
+#[test]
+fn unicode_normalization_forms_are_one_file() {
+    let sb = Sandbox::ready();
+    let nfc = "caf\u{e9}";
+    let nfd = "cafe\u{301}";
+    sb.write_home(".tracked/plain", "p\n");
+    sb.ok(&["~/.tracked", "-y"]);
+    // The store (say, from git on Linux) has the composed name; home (say,
+    // an older macOS app) has the decomposed one.
+    sb.write_store(&format!(".tracked/{nfc}"), "store\n");
+    sb.write_home(&format!(".tracked/{nfd}"), "home\n");
+
+    let text = sb.ok(&["status"]);
+    assert_eq!(
+        text.matches("caf").count(),
+        1,
+        "one entry, not two:\n{text}"
+    );
+    assert!(text.contains(&format!("~ .tracked/{nfc}")), "{text}");
+
+    sb.ok(&["-y"]);
+    let text = sb.ok(&["list", "--plain"]);
+    assert_eq!(text.matches("caf").count(), 1, "{text}");
+    assert_eq!(sb.read_store(&format!(".tracked/{nfc}")), "home\n");
+
+    // Restore writes back to the name that exists at home.
+    sb.write_store(&format!(".tracked/{nfc}"), "store2\n");
+    sb.ok(&["restore", "-y"]);
+    let text = sb.ok(&["list", "--plain"]);
+    assert_eq!(text.matches("caf").count(), 1, "{text}");
+    let home_files: Vec<String> = fs::read_dir(sb.home_path(".tracked"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("caf"))
+        .collect();
+    assert_eq!(home_files.len(), 1, "{home_files:?}");
+    assert_eq!(
+        fs::read_to_string(sb.home_path(&format!(".tracked/{nfd}"))).unwrap(),
+        "store2\n"
+    );
+}
+
+#[test]
+fn non_utf8_names_are_skipped_not_fatal() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let sb = Sandbox::ready();
+    sb.write_home(".config/app/ok.conf", "ok\n");
+    sb.ok(&["~/.config/app", "-y"]);
+    let bad = sb
+        .home_path(".config/app")
+        .join(OsStr::from_bytes(b"bad\xff.conf"));
+    if fs::write(&bad, "x").is_err() {
+        return; // the filesystem refuses such names (APFS does)
+    }
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("skipped"), "{text}");
+    assert!(text.contains("not valid UTF-8"), "{text}");
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("nothing to save"), "{text}");
+    fs::write(
+        sb.store_path(".config/app")
+            .join(OsStr::from_bytes(b"bad\xff.conf")),
+        "x",
+    )
+    .unwrap();
+    let text = sb.ok(&["list", "--plain"]);
+    assert_eq!(text, ".config/app/ok.conf\n");
+}

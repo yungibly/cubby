@@ -87,8 +87,17 @@ file from the store and it is no longer tracked.
 the directory in the store's manifest. A tracked directory is mirrored as a
 whole: files you add at home are saved next time you run `cubby`, and files
 you delete at home are removed from the store (after a backup). A directory
-that does not exist at home at all is left alone in the store, so running
-`cubby` on a fresh machine before `cubby restore` cannot wipe anything.
+that does not exist at home, or exists but holds no files at all, is left
+alone in the store with a warning, so running `cubby` on a fresh machine or
+with an unmounted volume cannot wipe anything. Use `cubby untrack` when you
+really mean to drop a directory.
+
+**Paths are tracked as typed.** `cubby ~/.myapp/sub` tracks `.myapp/sub` even
+when `~/.myapp` is a symlink to somewhere else, so the store mirrors the paths
+you use rather than where the bytes happen to live. Names are stored in
+Unicode NFC form, so a file named in decomposed form at home and composed
+form in the store is one file, not two. Names that are not valid UTF-8 are
+skipped with a note.
 
 **Symlinks** are tracked as symlinks and restored as symlinks, pointing at the
 same target. cubby never follows them.
@@ -122,7 +131,8 @@ manifest are always ignored.
   20 backup sets are kept.
 - Bulk operations show a preview and ask before proceeding. Without a
   terminal they refuse to guess and ask for `--yes`.
-- Special files (sockets, devices) are reported and skipped.
+- Special files (sockets, devices) are reported and skipped, and a file that
+  cannot be read shows up as an error in `status` rather than as a change.
 
 ## Configuration
 

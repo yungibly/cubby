@@ -7,6 +7,8 @@
 //! told it to.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::Path;
 
 use anyhow::Result;
 use walkdir::WalkDir;
@@ -37,7 +39,7 @@ pub enum State {
     Missing { deleted: bool },
     /// Present on both sides but as different kinds of thing.
     Conflict { home: Kind, store: Kind },
-    /// Could not be compared.
+    /// Could not be compared, or could not be read.
     Error(String),
 }
 
@@ -57,14 +59,26 @@ pub struct Entry {
     pub dir: Option<Rel>,
 }
 
+/// Something that was skipped, and why.
+#[derive(Clone, Debug)]
+pub struct Note {
+    /// A path for display; it may not be a valid [`Rel`].
+    pub path: String,
+    pub why: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Scan {
     /// Sorted by path.
     pub entries: Vec<Entry>,
     /// Tracked directories that do not exist at home.
     pub absent_dirs: Vec<Rel>,
-    /// Paths that were skipped, with the reason.
-    pub notes: Vec<(Rel, String)>,
+    /// Tracked directories that exist at home but hold no files while the
+    /// store has some. Treated like absent ones: an empty directory is far
+    /// more likely an unmounted volume or a wiped config than a deliberate
+    /// deletion of every file.
+    pub empty_dirs: Vec<Rel>,
+    pub notes: Vec<Note>,
 }
 
 /// Which paths a command is interested in. Empty means everything.
@@ -114,6 +128,7 @@ impl Scanner<'_> {
 
         let mut home_side: BTreeMap<Rel, Meta> = BTreeMap::new();
         let mut absent_dirs = Vec::new();
+        let mut empty_dirs = Vec::new();
         let mut present_dirs = Vec::new();
         let store_meta = fsx::lstat(&self.layout.store)?;
 
@@ -126,8 +141,13 @@ impl Scanner<'_> {
                 absent_dirs.push(dir.clone());
                 continue;
             }
-            present_dirs.push(dir.clone());
-            self.walk_home_dir(dir, scope, store_meta.as_ref(), &mut home_side, &mut notes)?;
+            let seen =
+                self.walk_home_dir(dir, scope, store_meta.as_ref(), &mut home_side, &mut notes)?;
+            if seen == 0 && store_side.keys().any(|r| r.is_within(dir)) {
+                empty_dirs.push(dir.clone());
+            } else {
+                present_dirs.push(dir.clone());
+            }
         }
 
         // Everything in the store that the directory walks did not find is
@@ -156,7 +176,10 @@ impl Scanner<'_> {
                         home_side.insert(rel.clone(), meta);
                     }
                     Kind::Dir => {}
-                    Kind::Other => notes.push((rel.clone(), "special file, skipped".into())),
+                    Kind::Other => notes.push(Note {
+                        path: rel.to_string(),
+                        why: "special file, skipped".into(),
+                    }),
                 }
             }
         }
@@ -169,7 +192,7 @@ impl Scanner<'_> {
             let home = home_side.get(rel);
             let store = store_side.get(rel);
             let dir = self.manifest.dir_for(rel).cloned();
-            let state = self.classify(rel, home, store, dir.as_ref(), &present_dirs);
+            let state = classify(home, store, dir.as_ref(), &present_dirs);
             entries.push(Entry {
                 rel: rel.clone(),
                 state,
@@ -182,6 +205,7 @@ impl Scanner<'_> {
         Ok(Scan {
             entries,
             absent_dirs,
+            empty_dirs,
             notes,
         })
     }
@@ -196,11 +220,7 @@ impl Scanner<'_> {
             .collect())
     }
 
-    fn walk_store(
-        &self,
-        scope: &Scope,
-        notes: &mut Vec<(Rel, String)>,
-    ) -> Result<BTreeMap<Rel, Meta>> {
+    fn walk_store(&self, scope: &Scope, notes: &mut Vec<Note>) -> Result<BTreeMap<Rel, Meta>> {
         let mut found = BTreeMap::new();
         if !self.layout.store.is_dir() {
             return Ok(found);
@@ -214,16 +234,25 @@ impl Scanner<'_> {
             let entry = match item {
                 Ok(e) => e,
                 Err(e) => {
-                    if let Some(p) = e.path()
-                        && let Ok(rel) = Rel::from_path_under(&self.layout.store, p)
-                    {
-                        notes.push((rel, format!("cannot read: {e}")));
+                    notes.push(walk_error(&self.layout.store, "store", &e));
+                    continue;
+                }
+            };
+            let is_dir = entry.file_type().is_dir();
+            let rel = match Rel::from_path_under(&self.layout.store, entry.path()) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    notes.push(Note {
+                        path: format!("store/{}", lossy(&self.layout.store, entry.path())),
+                        why: format!("skipped: {e}"),
+                    });
+                    if is_dir {
+                        walker.skip_current_dir();
                     }
                     continue;
                 }
             };
-            let rel = Rel::from_path_under(&self.layout.store, entry.path())?;
-            if entry.file_type().is_dir() {
+            if is_dir {
                 if self.ignore.is_ignored(&rel) || !scope.may_descend(&rel) {
                     walker.skip_current_dir();
                 }
@@ -234,10 +263,11 @@ impl Scanner<'_> {
             }
             if let Some(meta) = fsx::lstat(entry.path())? {
                 match meta.kind {
-                    Kind::File | Kind::Symlink => {
-                        found.insert(rel, meta);
-                    }
-                    Kind::Other => notes.push((rel, "special file in store, skipped".into())),
+                    Kind::File | Kind::Symlink => insert(&mut found, rel, meta, notes),
+                    Kind::Other => notes.push(Note {
+                        path: format!("store/{}", rel.as_str()),
+                        why: "special file, skipped".into(),
+                    }),
                     Kind::Dir => {}
                 }
             }
@@ -245,15 +275,18 @@ impl Scanner<'_> {
         Ok(found)
     }
 
+    /// Walk a tracked directory at home. Returns how many files and symlinks
+    /// were seen (ignored ones excluded), whether or not they were in scope.
     fn walk_home_dir(
         &self,
         dir: &Rel,
         scope: &Scope,
         store_meta: Option<&Meta>,
         found: &mut BTreeMap<Rel, Meta>,
-        notes: &mut Vec<(Rel, String)>,
-    ) -> Result<()> {
+        notes: &mut Vec<Note>,
+    ) -> Result<usize> {
         let root = self.layout.live(dir);
+        let mut seen = 0;
         let mut walker = WalkDir::new(&root)
             .follow_links(false)
             .min_depth(1)
@@ -263,17 +296,26 @@ impl Scanner<'_> {
             let entry = match item {
                 Ok(e) => e,
                 Err(e) => {
-                    if let Some(p) = e.path()
-                        && let Ok(rel) = Rel::from_path_under(&self.layout.home, p)
-                    {
-                        notes.push((rel, format!("cannot read: {e}")));
+                    notes.push(walk_error(&self.layout.home, "~", &e));
+                    continue;
+                }
+            };
+            let is_dir = entry.file_type().is_dir();
+            let rel = match Rel::from_path_under(&self.layout.home, entry.path()) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    notes.push(Note {
+                        path: format!("~/{}", lossy(&self.layout.home, entry.path())),
+                        why: format!("skipped: {e}"),
+                    });
+                    if is_dir {
+                        walker.skip_current_dir();
                     }
                     continue;
                 }
             };
-            let rel = Rel::from_path_under(&self.layout.home, entry.path())?;
             if self.ignore.is_ignored(&rel) {
-                if entry.file_type().is_dir() {
+                if is_dir {
                     walker.skip_current_dir();
                 }
                 continue;
@@ -289,61 +331,109 @@ impl Scanner<'_> {
                     }
                 }
                 Kind::File | Kind::Symlink => {
+                    seen += 1;
                     if scope.includes(&rel) {
-                        found.insert(rel, meta);
+                        insert(found, rel, meta, notes);
                     }
                 }
-                Kind::Other => notes.push((rel, "special file, skipped".into())),
+                Kind::Other => notes.push(Note {
+                    path: rel.to_string(),
+                    why: "special file, skipped".into(),
+                }),
             }
         }
-        Ok(())
+        Ok(seen)
     }
+}
 
-    fn classify(
-        &self,
-        rel: &Rel,
-        home: Option<&Meta>,
-        store: Option<&Meta>,
-        dir: Option<&Rel>,
-        present_dirs: &[Rel],
-    ) -> State {
-        match (home, store) {
-            (Some(h), Some(s)) if h.kind != s.kind => State::Conflict {
-                home: h.kind,
-                store: s.kind,
-            },
-            (Some(h), Some(s)) => {
-                let equal = match h.kind {
-                    Kind::Symlink => h.target == s.target,
-                    _ => {
-                        if h.is_executable() != s.is_executable() {
-                            false
-                        } else {
-                            match fsx::same_content(
-                                &self.layout.live(rel),
-                                h,
-                                &self.layout.stored(rel),
-                                s,
-                            ) {
-                                Ok(eq) => eq,
-                                Err(e) => return State::Error(format!("{e:#}")),
-                            }
+/// Insert into a side map, noting a second on-disk name that normalizes to
+/// the same path (possible on filesystems that keep both Unicode forms).
+fn insert(map: &mut BTreeMap<Rel, Meta>, rel: Rel, meta: Meta, notes: &mut Vec<Note>) {
+    if let Some(existing) = map.get(&rel) {
+        notes.push(Note {
+            path: rel.to_string(),
+            why: format!(
+                "{} and {} are the same name in different Unicode forms; using the first",
+                existing.path.display(),
+                meta.path.display()
+            ),
+        });
+        return;
+    }
+    map.insert(rel, meta);
+}
+
+fn walk_error(base: &Path, label: &str, e: &walkdir::Error) -> Note {
+    let path = e
+        .path()
+        .map(|p| format!("{label}/{}", lossy(base, p)))
+        .unwrap_or_else(|| label.to_owned());
+    Note {
+        path,
+        why: format!(
+            "cannot read: {}",
+            e.io_error()
+                .map(|io| io.to_string())
+                .unwrap_or_else(|| e.to_string())
+        ),
+    }
+}
+
+fn lossy(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn classify(
+    home: Option<&Meta>,
+    store: Option<&Meta>,
+    dir: Option<&Rel>,
+    present_dirs: &[Rel],
+) -> State {
+    match (home, store) {
+        (Some(h), Some(s)) if h.kind != s.kind => State::Conflict {
+            home: h.kind,
+            store: s.kind,
+        },
+        (Some(h), Some(s)) => {
+            let equal = match h.kind {
+                Kind::Symlink => h.target == s.target,
+                _ => {
+                    if h.is_executable() != s.is_executable() {
+                        false
+                    } else {
+                        match fsx::same_content(&h.path, h, &s.path, s) {
+                            Ok(eq) => eq,
+                            Err(e) => return State::Error(format!("{e:#}")),
                         }
                     }
-                };
-                if equal {
-                    State::Same
-                } else {
-                    State::Modified(newer(h, s))
                 }
+            };
+            if equal {
+                State::Same
+            } else {
+                State::Modified(newer(h, s))
             }
-            (Some(_), None) => State::New,
-            (None, Some(_)) => State::Missing {
-                deleted: dir.is_some_and(|d| present_dirs.contains(d)),
-            },
-            (None, None) => State::Error("vanished during scan".into()),
         }
+        (Some(h), None) => unreadable(h).unwrap_or(State::New),
+        (None, Some(s)) => unreadable(s).unwrap_or(State::Missing {
+            deleted: dir.is_some_and(|d| present_dirs.contains(d)),
+        }),
+        (None, None) => State::Error("vanished during scan".into()),
     }
+}
+
+/// An error state when a regular file cannot be opened for reading, since
+/// copying it would fail anyway.
+fn unreadable(meta: &Meta) -> Option<State> {
+    if meta.kind != Kind::File {
+        return None;
+    }
+    File::open(&meta.path)
+        .err()
+        .map(|e| State::Error(format!("cannot read: {e}")))
 }
 
 fn newer(home: &Meta, store: &Meta) -> Newer {

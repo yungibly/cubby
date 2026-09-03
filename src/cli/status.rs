@@ -105,27 +105,32 @@ pub fn run(ctx: &Ctx, paths: &[String]) -> Result<i32> {
         }
         printed = true;
     }
-    for dir in &scan.absent_dirs {
+    let dir_rows = scan
+        .absent_dirs
+        .iter()
+        .map(|d| (d, "tracked directory, does not exist at home"))
+        .chain(
+            scan.empty_dirs
+                .iter()
+                .map(|d| (d, "tracked directory, empty at home; store copy kept")),
+        );
+    for (dir, note) in dir_rows {
         if printed {
             println!();
             printed = false;
         }
-        println!(
-            "{}",
-            ui::row(
-                style,
-                &style.red("-"),
-                dir.as_str(),
-                "tracked directory, does not exist at home"
-            )
-        );
+        println!("{}", ui::row(style, &style.red("-"), dir.as_str(), note));
     }
-    for (rel, why) in &scan.notes {
-        println!("{}", ui::row(style, &style.yellow("!"), rel.as_str(), why));
+    for n in &scan.notes {
+        if printed {
+            println!();
+            printed = false;
+        }
+        println!("{}", ui::row(style, &style.yellow("!"), &n.path, &n.why));
     }
 
     let changes = modified.len() + new.len() + missing.len() + conflicts.len() + errors.len();
-    if changes == 0 && scan.absent_dirs.is_empty() {
+    if changes == 0 && scan.absent_dirs.is_empty() && scan.empty_dirs.is_empty() {
         let what = if scope.is_all() {
             format!(
                 "{} up to date",

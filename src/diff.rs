@@ -15,8 +15,16 @@ use crate::ui::Style;
 /// change; `reverse` flips it to what `cubby restore` would change.
 pub fn render(entry: &Entry, layout: &Layout, reverse: bool, style: &Style) -> Result<String> {
     let rel = &entry.rel;
-    let home = layout.live(rel);
-    let store = layout.stored(rel);
+    let home = entry
+        .home
+        .as_ref()
+        .map(|m| m.path.clone())
+        .unwrap_or_else(|| layout.live(rel));
+    let store = entry
+        .store
+        .as_ref()
+        .map(|m| m.path.clone())
+        .unwrap_or_else(|| layout.stored(rel));
     let (old_label, old_path, old_meta, new_label, new_path, new_meta) = if reverse {
         (
             "home",

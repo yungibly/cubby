@@ -12,7 +12,7 @@ use crate::backup::Backup;
 use crate::fsx;
 use crate::history::History;
 use crate::paths::{Layout, Rel};
-use crate::scan::{Newer, Scan, State};
+use crate::scan::{Entry, Newer, Scan, State};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -54,6 +54,10 @@ pub struct Action {
     pub op: Op,
     /// Short explanation shown next to the path.
     pub note: String,
+    /// Where to copy from (absent for removals).
+    pub src: Option<PathBuf>,
+    /// The path that gets written or removed.
+    pub dst: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +94,7 @@ impl Plan {
     }
 }
 
-pub fn plan(scan: &Scan, direction: Direction, force: bool) -> Plan {
+pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> Plan {
     let mut actions = Vec::new();
     let mut skipped = Vec::new();
     for e in &scan.entries {
@@ -98,6 +102,30 @@ pub fn plan(scan: &Scan, direction: Direction, force: bool) -> Plan {
         let skip = |why: Skip| Skipped {
             rel: rel.clone(),
             why,
+        };
+        // Real on-disk paths where they exist, the mirrored path otherwise.
+        let home_path = e
+            .home
+            .as_ref()
+            .map(|m| m.path.clone())
+            .unwrap_or_else(|| layout.live(&e.rel));
+        let store_path = e
+            .store
+            .as_ref()
+            .map(|m| m.path.clone())
+            .unwrap_or_else(|| layout.stored(&e.rel));
+        let copy = |op: Op, note: String| {
+            let (src, dst) = match direction {
+                Direction::Save => (home_path.clone(), store_path.clone()),
+                Direction::Restore => (store_path.clone(), home_path.clone()),
+            };
+            Action {
+                rel: e.rel.clone(),
+                op,
+                note,
+                src: Some(src),
+                dst,
+            }
         };
         match (&e.state, direction) {
             (State::Same, _) => {}
@@ -107,31 +135,23 @@ pub fn plan(scan: &Scan, direction: Direction, force: bool) -> Plan {
                     (Newer::Home, Direction::Restore) => ", home copy is newer",
                     _ => "",
                 };
-                actions.push(Action {
-                    rel,
-                    op: Op::Overwrite,
-                    note: format!("modified{warn}"),
-                });
+                actions.push(copy(Op::Overwrite, format!("modified{warn}")));
             }
-            (State::New, Direction::Save) => actions.push(Action {
-                rel,
-                op: Op::Create,
-                note: "new".into(),
-            }),
+            (State::New, Direction::Save) => actions.push(copy(Op::Create, "new".into())),
             (State::New, Direction::Restore) => skipped.push(skip(Skip::NewAtHome)),
             (State::Missing { deleted: true }, Direction::Save) => actions.push(Action {
-                rel,
+                rel: e.rel.clone(),
                 op: Op::Remove,
                 note: "deleted at home".into(),
+                src: None,
+                dst: store_path.clone(),
             }),
             (State::Missing { deleted: false }, Direction::Save) => {
                 skipped.push(skip(Skip::MissingAtHome))
             }
-            (State::Missing { .. }, Direction::Restore) => actions.push(Action {
-                rel,
-                op: Op::Create,
-                note: "missing at home".into(),
-            }),
+            (State::Missing { .. }, Direction::Restore) => {
+                actions.push(copy(Op::Create, "missing at home".into()))
+            }
             (State::Conflict { home, store }, dir) => {
                 let text = format!(
                     "home has {}, store has {}",
@@ -141,14 +161,11 @@ pub fn plan(scan: &Scan, direction: Direction, force: bool) -> Plan {
                 let replaceable =
                     !matches!(home, fsx::Kind::Dir) && !matches!(store, fsx::Kind::Dir);
                 if force && replaceable {
-                    actions.push(Action {
-                        rel,
-                        op: Op::Overwrite,
-                        note: match dir {
-                            Direction::Save => format!("{text}; replacing the store copy"),
-                            Direction::Restore => format!("{text}; replacing the home copy"),
-                        },
-                    });
+                    let note = match dir {
+                        Direction::Save => format!("{text}; replacing the store copy"),
+                        Direction::Restore => format!("{text}; replacing the home copy"),
+                    };
+                    actions.push(copy(Op::Overwrite, note));
                 } else {
                     skipped.push(skip(Skip::Conflict(text)));
                 }
@@ -161,6 +178,20 @@ pub fn plan(scan: &Scan, direction: Direction, force: bool) -> Plan {
         actions,
         skipped,
     }
+}
+
+/// Size at home of everything a plan would copy; for previews.
+pub fn bytes_to_copy(plan: &Plan, scan: &Scan) -> u64 {
+    plan.actions
+        .iter()
+        .filter(|a| a.op != Op::Remove)
+        .filter_map(|a| scan.entries.iter().find(|e| e.rel == a.rel))
+        .filter_map(|e: &Entry| match plan.direction {
+            Direction::Save => e.home.as_ref(),
+            Direction::Restore => e.store.as_ref(),
+        })
+        .map(|m| m.len)
+        .sum()
 }
 
 pub struct Outcome {
@@ -181,7 +212,7 @@ pub fn apply(
     let mut done = 0;
     let mut failed = Vec::new();
     for action in &plan.actions {
-        let result = perform(action, plan.direction, layout, backup.as_mut());
+        let result = perform(action, layout, backup.as_mut());
         match result {
             Ok(()) => {
                 done += 1;
@@ -215,39 +246,32 @@ fn op_name(action: &Action, direction: Direction) -> &'static str {
     }
 }
 
-fn perform(
-    action: &Action,
-    direction: Direction,
-    layout: &Layout,
-    backup: Option<&mut Backup>,
-) -> Result<()> {
+fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Result<()> {
     let rel = &action.rel;
     match action.op {
         Op::Remove => {
-            let path = layout.stored(rel);
-            if let Some(meta) = fsx::lstat(&path)?
+            if let Some(meta) = fsx::lstat(&action.dst)?
                 && let Some(b) = backup
             {
-                b.stash(rel, &path, &meta)?;
+                b.stash(rel, &action.dst, &meta)?;
             }
-            fsx::remove_entry(&path, &layout.store)
+            fsx::remove_entry(&action.dst, &layout.store)
         }
         Op::Create | Op::Overwrite => {
-            let (src, dst) = match direction {
-                Direction::Save => (layout.live(rel), layout.stored(rel)),
-                Direction::Restore => (layout.stored(rel), layout.live(rel)),
-            };
+            let src = action
+                .src
+                .as_ref()
+                .ok_or_else(|| anyhow!("no source for {rel}"))?;
             // Look again rather than trusting the scan: things change.
-            let src_meta =
-                fsx::lstat(&src)?.ok_or_else(|| anyhow!("{} vanished", src.display()))?;
-            let dst_meta = fsx::lstat(&dst)?;
+            let src_meta = fsx::lstat(src)?.ok_or_else(|| anyhow!("{} vanished", src.display()))?;
+            let dst_meta = fsx::lstat(&action.dst)?;
             if let Some(d) = &dst_meta
                 && let Some(b) = backup
             {
-                b.stash(rel, &dst, d)
-                    .with_context(|| format!("cannot back up {}", dst.display()))?;
+                b.stash(rel, &action.dst, d)
+                    .with_context(|| format!("cannot back up {}", action.dst.display()))?;
             }
-            fsx::copy_entry(&src, &src_meta, &dst, dst_meta.as_ref())
+            fsx::copy_entry(src, &src_meta, &action.dst, dst_meta.as_ref())
         }
     }
 }

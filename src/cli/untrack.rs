@@ -41,11 +41,10 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     }
 
     let scan = ctx.scanner().scan(&Scope::of(scope_rels.clone()))?;
-    let files: Vec<Rel> = scan
+    let files: Vec<(Rel, std::path::PathBuf)> = scan
         .entries
         .iter()
-        .filter(|e| e.store.is_some())
-        .map(|e| e.rel.clone())
+        .filter_map(|e| e.store.as_ref().map(|m| (e.rel.clone(), m.path.clone())))
         .collect();
 
     println!("{} {}", ctx.style.bold("untrack ←"), ctx.store_label());
@@ -61,7 +60,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         );
     }
     let cap = if ctx.verbose { usize::MAX } else { 40 };
-    for (i, rel) in files.iter().enumerate() {
+    for (i, (rel, _)) in files.iter().enumerate() {
         if i == cap {
             ctx.note(&format!(
                 "  … and {} more (use --verbose to list all)",
@@ -97,15 +96,14 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         .backups
         .then(|| Backup::new(&ctx.cfg.state_dir, "untrack"));
     let mut removed = 0;
-    for rel in &files {
-        let path = ctx.cfg.layout.stored(rel);
+    for (rel, path) in &files {
         let result = (|| -> Result<()> {
-            if let Some(meta) = fsx::lstat(&path)?
+            if let Some(meta) = fsx::lstat(path)?
                 && let Some(b) = backup.as_mut()
             {
-                b.stash(rel, &path, &meta)?;
+                b.stash(rel, path, &meta)?;
             }
-            fsx::remove_entry(&path, &ctx.cfg.layout.store)
+            fsx::remove_entry(path, &ctx.cfg.layout.store)
         })();
         match result {
             Ok(()) => {

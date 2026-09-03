@@ -10,11 +10,13 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
+use unicode_normalization::UnicodeNormalization;
 
 /// A normalized path relative to the home directory.
 ///
 /// Invariants: non-empty, uses `/` separators, no `.` or `..` components,
-/// no leading or trailing slash.
+/// no leading or trailing slash, and Unicode in NFC form (so a name typed or
+/// stored in decomposed form names the same file).
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Rel(String);
 
@@ -27,6 +29,7 @@ impl Rel {
             .strip_prefix("~/")
             .or_else(|| trimmed.strip_prefix('/'))
             .unwrap_or(trimmed);
+        let stripped = nfc(stripped);
         let mut parts: Vec<&str> = Vec::new();
         for part in stripped.split('/') {
             match part {
@@ -49,11 +52,9 @@ impl Rel {
         let mut parts = Vec::new();
         for comp in rel.components() {
             match comp {
-                Component::Normal(p) => parts.push(
-                    p.to_str()
-                        .ok_or_else(|| anyhow!("{} is not valid UTF-8", path.display()))?
-                        .to_owned(),
-                ),
+                Component::Normal(p) => parts.push(nfc(p
+                    .to_str()
+                    .ok_or_else(|| anyhow!("{} is not valid UTF-8", path.display()))?)),
                 Component::CurDir => {}
                 _ => bail!("{} is not inside {}", path.display(), base.display()),
             }
@@ -124,13 +125,16 @@ impl Layout {
     /// Turn a user-supplied path into a [`Rel`].
     ///
     /// Accepts `~/x`, absolute paths, and paths relative to the current
-    /// directory. Symlinks in the *parent* directories are resolved so that,
-    /// for example, `/var/...` and `/private/var/...` on macOS agree; the
-    /// final component is kept as-is so symlinks can be tracked as symlinks.
+    /// directory. The path is tracked as typed: `~/.myapp/sub` is
+    /// `.myapp/sub` even when `~/.myapp` is a symlink to somewhere else, so
+    /// the store stays a mirror of the paths you use. Symlinks are only
+    /// resolved when the path is not lexically inside home (a differently
+    /// spelled home directory, say).
     ///
-    /// Refuses paths outside home, home itself, anything inside the store,
-    /// and symlinks that point into the store (a `stow`-style setup, where
-    /// copying would clobber the file with a link to itself).
+    /// Refuses paths outside home, home itself, anything whose real location
+    /// is inside the store, and symlinks that point into the store (a
+    /// `stow`-style setup, where copying would clobber the file with a link
+    /// to itself).
     pub fn resolve(&self, arg: &str) -> Result<Rel> {
         let expanded = expand_tilde(arg, &self.home);
         let absolute = if expanded.is_absolute() {
@@ -139,28 +143,39 @@ impl Layout {
             std::env::current_dir()?.join(expanded)
         };
         let normalized = normalize(&absolute);
-        let resolved = resolve_parents(&normalized)?;
-
-        if resolved == self.home {
+        if normalized == self.home {
             bail!("the home directory itself cannot be tracked");
         }
-        if resolved.starts_with(&self.store) {
+
+        let (path, rel) = match Rel::from_path_under(&self.home, &normalized) {
+            Ok(rel) => (normalized, rel),
+            Err(_) => {
+                let resolved = resolve_parents(&normalized)?;
+                let rel = Rel::from_path_under(&self.home, &resolved).map_err(|_| {
+                    anyhow!(
+                        "{arg} is outside your home directory ({})",
+                        self.home.display()
+                    )
+                })?;
+                (resolved, rel)
+            }
+        };
+
+        // Safety checks look at where the path really is.
+        let real = resolve_parents(&path)?;
+        if real == self.home {
+            bail!("the home directory itself cannot be tracked");
+        }
+        if real.starts_with(&self.store) {
             bail!(
                 "{} is inside the store ({}); cubby tracks files in your home directory, not in the store",
                 arg,
                 self.pretty(&self.store)
             );
         }
-        let rel = Rel::from_path_under(&self.home, &resolved).map_err(|_| {
-            anyhow!(
-                "{arg} is outside your home directory ({})",
-                self.home.display()
-            )
-        })?;
-
-        if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
             && meta.file_type().is_symlink()
-            && let Ok(target) = std::fs::canonicalize(&resolved)
+            && let Ok(target) = std::fs::canonicalize(&path)
             && target.starts_with(&self.store)
         {
             bail!(
@@ -169,6 +184,15 @@ impl Layout {
             );
         }
         Ok(rel)
+    }
+}
+
+/// Canonical composition (NFC) of a name; a no-op for ASCII.
+fn nfc(s: &str) -> String {
+    if s.is_ascii() {
+        s.to_owned()
+    } else {
+        s.nfc().collect()
     }
 }
 
@@ -255,6 +279,15 @@ mod tests {
         assert!(nvim.is_within(&nvim));
         assert!(!Rel::parse(".config/nvim2/x").unwrap().is_within(&nvim));
         assert!(!Rel::parse(".config").unwrap().is_within(&nvim));
+    }
+
+    #[test]
+    fn names_are_composed() {
+        let nfd = "caf\u{65}\u{301}";
+        let r = Rel::parse(&format!(".config/{nfd}")).unwrap();
+        assert_eq!(r.as_str(), ".config/caf\u{e9}");
+        let r = Rel::from_path_under(Path::new("/h"), Path::new(&format!("/h/{nfd}"))).unwrap();
+        assert_eq!(r.as_str(), "caf\u{e9}");
     }
 
     #[test]

@@ -49,8 +49,8 @@ pub fn run(ctx: &Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Result
         out.push_str(&text);
         shown += 1;
     }
-    for (rel, why) in &scan.notes {
-        ctx.warn(&format!("{rel}: {why}"));
+    for n in &scan.notes {
+        ctx.warn(&format!("{}: {}", n.path, n.why));
     }
     if shown == 0 {
         println!(

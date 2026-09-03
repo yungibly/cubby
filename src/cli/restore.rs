@@ -30,9 +30,9 @@ pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
         }
     }
 
-    let plan = plan::plan(&scan, Direction::Restore, force);
-    for (rel, why) in &scan.notes {
-        ctx.warn(&format!("{rel}: {why}"));
+    let plan = plan::plan(&scan, &ctx.cfg.layout, Direction::Restore, force);
+    for n in &scan.notes {
+        ctx.warn(&format!("{}: {}", n.path, n.why));
     }
 
     if plan.is_empty() {

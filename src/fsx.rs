@@ -33,6 +33,8 @@ impl Kind {
 /// What `lstat` tells us about a path, without following symlinks.
 #[derive(Clone, Debug)]
 pub struct Meta {
+    /// The path this was read from, exactly as it exists on disk.
+    pub path: PathBuf,
     pub kind: Kind,
     pub len: u64,
     pub mode: u32,
@@ -80,6 +82,7 @@ pub fn lstat(path: &Path) -> Result<Option<Meta>> {
         None
     };
     Ok(Some(Meta {
+        path: path.to_path_buf(),
         kind,
         len: md.len(),
         mode: md.mode() & 0o7777,
