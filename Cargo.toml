@@ -1,0 +1,29 @@
+[package]
+name = "cubby"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Keep copies of your dotfiles in a store that mirrors your home directory"
+license = "MIT"
+repository = "https://github.com/yungibly/cubby"
+readme = "README.md"
+keywords = ["dotfiles", "cli", "backup", "sync"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
+clap_complete = "4.6.9"
+globset = "0.4.20"
+jiff = "0.2.35"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+similar = "3.2.0"
+tempfile = "3.27.0"
+toml = "1.1.5"
+walkdir = "2.5.0"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

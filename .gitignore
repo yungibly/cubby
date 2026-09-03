@@ -1,4 +1,5 @@
-cubby
-pkg/
-cubby-*.pkg.tar.zst
-cubby-debug-*.pkg.tar.zst
+/target
+/dist
+/sandbox
+*.swp
+.DS_Store
