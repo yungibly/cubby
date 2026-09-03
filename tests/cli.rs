@@ -931,3 +931,50 @@ fn non_utf8_names_are_skipped_not_fatal() {
     let text = sb.ok(&["list", "--plain"]);
     assert_eq!(text, ".config/app/ok.conf\n");
 }
+
+#[test]
+fn status_quiet_uses_exit_codes() {
+    let sb = Sandbox::new();
+    let out = sb.cmd(&["status", "-q"]);
+    assert_eq!(out.status.code(), Some(2), "no store is an error");
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+
+    sb.ok(&["init"]);
+    let out = sb.cmd(&["status", "-q"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+
+    sb.write_home(".zshrc", "z\n");
+    sb.ok(&["~/.zshrc", "-y"]);
+    assert_eq!(sb.cmd(&["status", "--quiet"]).status.code(), Some(0));
+
+    sb.write_home(".zshrc", "changed\n");
+    let out = sb.cmd(&["status", "-q"]);
+    assert_eq!(out.status.code(), Some(1), "modified");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+
+    sb.ok(&["-y"]);
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(0));
+    fs::remove_file(sb.home_path(".zshrc")).unwrap();
+    assert_eq!(
+        sb.cmd(&["status", "-q"]).status.code(),
+        Some(1),
+        "missing at home"
+    );
+    sb.ok(&["restore", "-y"]);
+
+    // An untracked file named explicitly is not "dirty"; a bad path is an error.
+    sb.write_home(".other", "o\n");
+    assert_eq!(sb.cmd(&["status", "-q", "~/.other"]).status.code(), Some(0));
+    assert_eq!(
+        sb.cmd(&["status", "-q", "/etc/hosts"]).status.code(),
+        Some(2)
+    );
+
+    // A tracked directory missing at home counts as dirty.
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.ok(&["~/.config/app", "-y"]);
+    fs::remove_dir_all(sb.home_path(".config/app")).unwrap();
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(1));
+}

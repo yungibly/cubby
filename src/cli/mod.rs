@@ -119,6 +119,9 @@ enum Command {
     Status {
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
+        /// Print nothing; exit 0 when up to date, 1 when anything differs, 2 on error
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Show line-by-line differences between home and the store
     Diff {
@@ -423,9 +426,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let ctx = Ctx::load(&global)?;
             restore::run(&ctx, &paths, force)
         }
-        Some(Command::Status { paths }) => {
+        Some(Command::Status { paths, quiet }) => {
             let ctx = Ctx::load(&global)?;
-            status::run(&ctx, &paths)
+            status::run(&ctx, &paths, quiet)
         }
         Some(Command::Diff {
             paths,

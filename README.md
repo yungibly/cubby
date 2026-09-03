@@ -53,7 +53,7 @@ On a new machine, clone the store to `~/.dotfiles` and run `cubby restore`.
 | `cubby [PATH...]` | Same as `cubby save`. |
 | `cubby save [PATH...]` | Copy home → store. With no paths, saves every tracked file that changed. A directory named here becomes tracked as a whole. Alias: `add`. |
 | `cubby restore [PATH...]` | Copy store → home. Creates missing files and overwrites modified ones; never deletes. |
-| `cubby status [PATH...]` | Show what is modified, new, missing, or conflicting. |
+| `cubby status [PATH...]` | Show what is modified, new, missing, or conflicting. `-q` prints nothing and exits 0 when up to date, 1 when anything differs, 2 on error. |
 | `cubby diff [PATH...]` | Unified diffs, store → home. `-R` flips the direction. Paged when on a terminal. |
 | `cubby list` | The store as a tree. `--plain` prints one path per line. Alias: `ls`. |
 | `cubby untrack PATH...` | Remove files or a tracked directory from the store. Home is untouched. Alias: `rm`. |
@@ -117,6 +117,18 @@ file or directory name at any depth (`*.swp`, `lazy-lock.json`); one with a
 slash matches a path relative to home (`.config/nvim/secret/**`). `.git`
 directories, `.DS_Store`, and the store's own `README*`, `LICENSE*`, and
 manifest are always ignored.
+
+### A marker in your prompt
+
+`cubby status --quiet` is cheap enough to run before every prompt. In zsh:
+
+```zsh
+precmd() { cubby status --quiet 2>/dev/null; psvar[1]=$([[ $? == 1 ]] && echo '✱'); }
+PROMPT='%1v%~ %# '
+```
+
+The marker appears when anything needs saving or restoring, and stays silent
+when cubby is not set up on that machine (exit code 2).
 
 ## Safety
 

@@ -4,7 +4,17 @@ use super::Ctx;
 use crate::scan::{Newer, Scope, State};
 use crate::ui;
 
-pub fn run(ctx: &Ctx, paths: &[String]) -> Result<i32> {
+pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
+    if quiet {
+        // grep-style codes so a prompt can tell "differs" from "broken".
+        return match run_quiet(ctx, paths) {
+            Ok(code) => Ok(code),
+            Err(e) => {
+                ctx.error(&format!("{e:#}"));
+                Ok(2)
+            }
+        };
+    }
     ctx.require_store()?;
     let (rels, failures) = ctx.resolve_paths(paths);
     if !paths.is_empty() && rels.is_empty() {
@@ -172,4 +182,25 @@ pub fn run(ctx: &Ctx, paths: &[String]) -> Result<i32> {
         }
     }
     Ok(if failures > 0 { 1 } else { 0 })
+}
+
+fn run_quiet(ctx: &Ctx, paths: &[String]) -> Result<i32> {
+    ctx.require_store()?;
+    let (rels, failures) = ctx.resolve_paths(paths);
+    if failures > 0 {
+        return Ok(2);
+    }
+    let scope = if paths.is_empty() {
+        Scope::all()
+    } else {
+        Scope::of(rels)
+    };
+    let scan = ctx.scanner().scan(&scope)?;
+    let dirty = scan
+        .entries
+        .iter()
+        .any(|e| !e.state.is_same() && !(matches!(e.state, State::New) && e.dir.is_none()))
+        || !scan.absent_dirs.is_empty()
+        || !scan.empty_dirs.is_empty();
+    Ok(if dirty { 1 } else { 0 })
 }
