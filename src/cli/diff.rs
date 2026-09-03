@@ -6,7 +6,7 @@ use crate::ui;
 
 pub fn run(ctx: &Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Result<i32> {
     ctx.require_store()?;
-    let (rels, failures) = ctx.resolve_paths(paths);
+    let (rels, mut failures) = ctx.resolve_paths(paths);
     if !paths.is_empty() && rels.is_empty() {
         return Ok(1);
     }
@@ -16,6 +16,16 @@ pub fn run(ctx: &Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Result
         Scope::of(rels)
     };
     let scan = ctx.scanner().scan(&scope)?;
+    for rel in &scope.rels {
+        if !scan
+            .entries
+            .iter()
+            .any(|e| e.rel.is_within(rel) && e.store.is_some())
+        {
+            ctx.error(&format!("nothing in the store at {rel}"));
+            failures += 1;
+        }
+    }
 
     let mut out = String::new();
     let mut shown = 0;

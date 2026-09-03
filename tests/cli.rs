@@ -385,7 +385,13 @@ fn status_reports_every_kind_of_difference() {
     assert!(text.contains("up to date\n  = .zshrc"), "{text}");
 
     let text = sb.ok(&["status", "~/.nope"]);
-    assert!(text.contains("up to date"), "{text}");
+    assert!(
+        text.contains("? .nope") && text.contains("nothing tracked here"),
+        "{text}"
+    );
+    assert!(!text.contains("up to date"), "{text}");
+    let text = sb.fail(&["diff", "~/.nope"]);
+    assert!(text.contains("nothing in the store at ~/.nope"), "{text}");
     let text = sb.ok(&["status", "~/.zshrc"]);
     assert!(!text.contains(".gitconfig"), "{text}");
 }

@@ -18,6 +18,22 @@ pub fn run(ctx: &Ctx, paths: &[String]) -> Result<i32> {
     let scan = ctx.scanner().scan(&scope)?;
     let style = &ctx.style;
 
+    // Named paths with nothing tracked beneath them.
+    let mut found_any = scope.is_all();
+    for rel in &scope.rels {
+        if scan.entries.iter().any(|e| e.rel.is_within(rel)) {
+            found_any = true;
+        } else {
+            println!(
+                "{}",
+                ui::row(style, &style.dim("?"), rel.as_str(), "nothing tracked here")
+            );
+        }
+    }
+    if !found_any {
+        return Ok(if failures > 0 { 1 } else { 0 });
+    }
+
     let mut modified = Vec::new();
     let mut new = Vec::new();
     let mut untracked = Vec::new();

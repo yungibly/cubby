@@ -53,7 +53,7 @@ struct Cli {
     command: Option<Command>,
 
     /// Files or directories to save (same as `cubby save PATH...`)
-    #[arg(value_name = "PATH")]
+    #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
     paths: Vec<String>,
 
     /// Replace files whose kind differs between home and store
@@ -79,11 +79,11 @@ struct Global {
     verbose: bool,
 
     /// Use this store instead of the configured one
-    #[arg(long, global = true, value_name = "DIR")]
+    #[arg(long, global = true, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     store: Option<PathBuf>,
 
     /// Read this config file instead of the default
-    #[arg(long, global = true, value_name = "FILE")]
+    #[arg(long, global = true, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     config: Option<PathBuf>,
 
     /// Do not back up files that get overwritten or removed
@@ -101,7 +101,7 @@ enum Command {
     #[command(visible_alias = "add")]
     Save {
         /// Files or directories to save; a directory becomes tracked as a whole
-        #[arg(value_name = "PATH")]
+        #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
         /// Replace files whose kind differs between home and store
         #[arg(long)]
@@ -109,7 +109,7 @@ enum Command {
     },
     /// Copy files from the store back into home (all tracked files, or the given paths)
     Restore {
-        #[arg(value_name = "PATH")]
+        #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
         /// Replace files whose kind differs between home and store
         #[arg(long)]
@@ -117,12 +117,12 @@ enum Command {
     },
     /// Show what differs between home and the store
     Status {
-        #[arg(value_name = "PATH")]
+        #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
     },
     /// Show line-by-line differences between home and the store
     Diff {
-        #[arg(value_name = "PATH")]
+        #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
         /// Diff in the restore direction (store as new, home as old)
         #[arg(short = 'R', long)]
@@ -141,7 +141,7 @@ enum Command {
     /// Stop tracking files or directories (removes them from the store)
     #[command(visible_alias = "rm")]
     Untrack {
-        #[arg(value_name = "PATH", required = true)]
+        #[arg(value_name = "PATH", required = true, value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
     },
     /// Show what cubby has done
@@ -159,7 +159,7 @@ enum Command {
     /// Create the config file and the store
     Init {
         /// Where the store should live (default: ~/.dotfiles)
-        #[arg(value_name = "DIR")]
+        #[arg(value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         dir: Option<String>,
         /// Overwrite an existing config file
         #[arg(long)]
