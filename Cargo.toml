@@ -1,6 +1,6 @@
 [package]
 name = "cubby"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Keep copies of your dotfiles in a store that mirrors your home directory"
