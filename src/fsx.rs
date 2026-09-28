@@ -39,6 +39,10 @@ pub struct Meta {
     pub len: u64,
     pub mode: u32,
     pub mtime: SystemTime,
+    /// Modification and status-change times in nanoseconds since the
+    /// epoch, for noticing change without reading a file.
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
     pub dev: u64,
     pub ino: u64,
     /// The link target, for symlinks.
@@ -91,6 +95,8 @@ pub fn lstat(path: &Path) -> Result<Option<Meta>> {
         len: md.len(),
         mode: md.mode() & 0o7777,
         mtime: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        mtime_ns: md.mtime().saturating_mul(1_000_000_000) + md.mtime_nsec(),
+        ctime_ns: md.ctime().saturating_mul(1_000_000_000) + md.ctime_nsec(),
         dev: md.dev(),
         ino: md.ino(),
         target,
@@ -100,31 +106,6 @@ pub fn lstat(path: &Path) -> Result<Option<Meta>> {
 
 pub fn same_inode(a: &Meta, b: &Meta) -> bool {
     a.dev == b.dev && a.ino == b.ino
-}
-
-/// Whether two regular files have identical contents. Sizes are compared
-/// first so most differing files never get read.
-pub fn same_content(a: &Path, a_meta: &Meta, b: &Path, b_meta: &Meta) -> Result<bool> {
-    if a_meta.len != b_meta.len {
-        return Ok(false);
-    }
-    if same_inode(a_meta, b_meta) {
-        return Ok(true);
-    }
-    let mut fa = File::open(a).with_context(|| format!("cannot read {}", a.display()))?;
-    let mut fb = File::open(b).with_context(|| format!("cannot read {}", b.display()))?;
-    let mut ba = vec![0u8; 64 * 1024];
-    let mut bb = vec![0u8; 64 * 1024];
-    loop {
-        let na = read_full(&mut fa, &mut ba)?;
-        let nb = read_full(&mut fb, &mut bb)?;
-        if na != nb || ba[..na] != bb[..nb] {
-            return Ok(false);
-        }
-        if na == 0 {
-            return Ok(true);
-        }
-    }
 }
 
 fn read_full(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
@@ -475,23 +456,6 @@ mod tests {
         assert!(existing.join(".ssh/keys").is_dir());
         // Directories that already existed are not touched.
         assert_ne!(mode(&existing), 0o700);
-    }
-
-    #[test]
-    fn same_content_compares_bytes() {
-        let sb = sandbox();
-        let a = sb.path().join("a");
-        let b = sb.path().join("b");
-        fs::write(&a, vec![7u8; 200_000]).unwrap();
-        fs::write(&b, vec![7u8; 200_000]).unwrap();
-        let am = lstat(&a).unwrap().unwrap();
-        let bm = lstat(&b).unwrap().unwrap();
-        assert!(same_content(&a, &am, &b, &bm).unwrap());
-        let mut data = vec![7u8; 200_000];
-        data[199_999] = 8;
-        fs::write(&b, data).unwrap();
-        let bm = lstat(&b).unwrap().unwrap();
-        assert!(!same_content(&a, &am, &b, &bm).unwrap());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::ui;
 
 pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     ctx.require_store()?;
+    ctx.require_lock()?;
     let (rels, mut failures) = ctx.resolve_paths(paths);
     if !paths.is_empty() && rels.is_empty() {
         return Ok(1);
@@ -75,6 +76,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     };
 
     let scan = ctx.scanner().scan(&scope)?;
+    ctx.learn(&scan, &scope);
     let plan = plan::plan(
         &scan,
         &ctx.cfg.layout,

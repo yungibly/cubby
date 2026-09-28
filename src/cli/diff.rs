@@ -7,12 +7,16 @@ use crate::ui;
 /// Show what `cubby save` would change (or, reversed, what `cubby restore`
 /// would), and nothing else: files that command would leave alone are
 /// counted in a note rather than shown as deletions.
-pub fn run(ctx: &Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Result<i32> {
+pub fn run(ctx: &mut Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Result<i32> {
     ctx.require_store()?;
     let Some((scope, mut failures)) = ctx.scope_for(paths) else {
         return Ok(1);
     };
     let scan = ctx.scanner().scan(&scope)?;
+    ctx.learn(&scan, &scope);
+    // Nothing more to write: let other cubby commands run while the pager
+    // is open.
+    ctx.release_lock();
     failures += ctx.report_unstored(&scope, &scan);
 
     let mut out = String::new();
@@ -22,12 +26,19 @@ pub fn run(ctx: &Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Result
         let applies = match (&e.state, reverse) {
             (State::Same, _) => continue,
             // Not tracked; nothing in the store to compare with.
-            (State::New, _) if e.dir.is_none() => continue,
+            (s, _) if s.is_untracked(e.dir.as_ref()) => continue,
             // Restore never deletes anything at home.
-            (State::New, true) => false,
+            (State::New { .. }, true) => false,
             // Save leaves a file that is only in the store alone unless it
             // was deleted from a tracked directory.
-            (State::Missing { deleted: false }, false) => false,
+            (
+                State::Missing {
+                    was_here,
+                    under_present_dir,
+                    ..
+                },
+                false,
+            ) => *was_here && *under_present_dir,
             _ => true,
         };
         if !applies {

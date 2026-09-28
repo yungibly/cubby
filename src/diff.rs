@@ -72,7 +72,7 @@ pub fn render(entry: &Entry, layout: &Layout, reverse: bool, style: &Style) -> R
             );
             return Ok(out);
         }
-        State::New | State::Missing { .. } | State::Modified(_) => {}
+        State::New { .. } | State::Missing { .. } | State::Modified(_) => {}
     }
 
     let kind = old_meta.or(new_meta).map(|m| m.kind).unwrap_or(Kind::File);

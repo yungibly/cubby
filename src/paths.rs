@@ -105,6 +105,13 @@ impl fmt::Display for Rel {
     }
 }
 
+/// One side of the mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Home,
+    Store,
+}
+
 /// Where home and the store live on disk, and how to map between them.
 #[derive(Clone, Debug)]
 pub struct Layout {

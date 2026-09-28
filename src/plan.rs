@@ -15,9 +15,11 @@ use anyhow::{Context, Result, anyhow};
 use crate::backup::Backup;
 use crate::fsx::{self, Kind, Perms};
 use crate::history::History;
+use crate::index::{self, Index};
+pub use crate::paths::Side;
 use crate::paths::{Layout, Rel};
 use crate::perms;
-use crate::scan::{Entry, Newer, Scan, State};
+use crate::scan::{Change, Entry, Scan, State};
 
 /// Which way a save or restore copies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,13 +38,6 @@ impl Direction {
             Direction::Restore => Side::Home,
         }
     }
-}
-
-/// One side of the mirror.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    Home,
-    Store,
 }
 
 /// What a run of cubby is doing, for messages, backups, and history.
@@ -131,11 +126,20 @@ pub struct ModeRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Skip {
-    /// In the store but not at home, and not under a tracked directory
-    /// that exists at home (so it was not "deleted", it is just absent).
-    MissingAtHome,
+    /// In the store but not at home, and not a deletion to mirror: new in
+    /// the store, or (`was_here`) deleted at home outside a tracked
+    /// directory.
+    MissingAtHome {
+        was_here: bool,
+    },
     /// At home but not in the store.
     NewAtHome,
+    /// Changed on this side since the last sync; copying over it would undo
+    /// that change. Needs `--force`.
+    ChangedThere(Side),
+    /// Deleted from the store since the last sync; saving would add it
+    /// back. Needs `--force`.
+    DeletedFromStore,
     Conflict(String),
     Error(String),
 }
@@ -259,36 +263,84 @@ pub fn plan(
                 mode: None,
             }
         };
+        let remove = |note: &str| Action {
+            rel: e.rel.clone(),
+            op: Op::Remove,
+            side: Side::Store,
+            note: note.to_owned(),
+            src: None,
+            dst: store_path.clone(),
+            len: 0,
+            perms: Perms::default(),
+            mode: None,
+        };
+        // The side this run would copy over, when that side changed.
+        let there = match direction {
+            Direction::Save => (Change::Store, "changed in the store"),
+            Direction::Restore => (Change::Home, "changed at home"),
+        };
         match (&e.state, direction) {
             (State::Same, _) => {}
-            (State::Modified(newer), dir) => {
-                let warn = match (newer, dir) {
-                    (Newer::Store, Direction::Save) => ", store copy is newer",
-                    (Newer::Home, Direction::Restore) => ", home copy is newer",
-                    _ => "",
+            (State::Modified(Change::Both), _) if !force => plan.skipped.push(skip(
+                Skip::Conflict("changed at home and in the store".into()),
+            )),
+            (State::Modified(change), _) if *change == there.0 && !force => plan
+                .skipped
+                .push(skip(Skip::ChangedThere(direction.writes()))),
+            (State::Modified(change), _) => {
+                let note = match change {
+                    Change::Home => "changed at home".to_owned(),
+                    Change::Store => "changed in the store".to_owned(),
+                    Change::Unknown => "modified".to_owned(),
+                    Change::Both => "changed at home and in the store".to_owned(),
                 };
-                plan.actions
-                    .push(copy(Op::Overwrite, format!("modified{warn}")));
+                let note = if *change == there.0 || *change == Change::Both {
+                    format!("{note}; replacing that copy")
+                } else {
+                    note
+                };
+                plan.actions.push(copy(Op::Overwrite, note));
             }
-            (State::New, Direction::Save) => plan.actions.push(copy(Op::Create, "new".into())),
-            (State::New, Direction::Restore) => plan.skipped.push(skip(Skip::NewAtHome)),
-            (State::Missing { deleted: true }, Direction::Save) => plan.actions.push(Action {
-                rel: e.rel.clone(),
-                op: Op::Remove,
-                side: Side::Store,
-                note: "deleted at home".into(),
-                src: None,
-                dst: store_path.clone(),
-                len: 0,
-                perms: Perms::default(),
-                mode: None,
-            }),
-            (State::Missing { deleted: false }, Direction::Save) => {
-                plan.skipped.push(skip(Skip::MissingAtHome))
+            (State::New { was_stored: false }, Direction::Save) => {
+                plan.actions.push(copy(Op::Create, "new".into()))
             }
-            (State::Missing { .. }, Direction::Restore) => plan
-                .actions
-                .push(copy(Op::Create, "missing at home".into())),
+            (State::New { was_stored: true }, Direction::Save) if force => plan.actions.push(copy(
+                Op::Create,
+                "deleted from the store since the last sync; adding it back".into(),
+            )),
+            (State::New { was_stored: true }, Direction::Save) => {
+                plan.skipped.push(skip(Skip::DeletedFromStore))
+            }
+            (State::New { .. }, Direction::Restore) => plan.skipped.push(skip(Skip::NewAtHome)),
+            (
+                State::Missing {
+                    was_here: true,
+                    under_present_dir: true,
+                    store_changed,
+                },
+                Direction::Save,
+            ) => match (store_changed, force) {
+                (false, _) => plan.actions.push(remove("deleted at home")),
+                (true, true) => plan
+                    .actions
+                    .push(remove("deleted at home; removing the store's newer copy")),
+                (true, false) => plan.skipped.push(skip(Skip::Conflict(
+                    "deleted at home, changed in the store".into(),
+                ))),
+            },
+            (State::Missing { was_here, .. }, Direction::Save) => {
+                plan.skipped.push(skip(Skip::MissingAtHome {
+                    was_here: *was_here,
+                }))
+            }
+            (State::Missing { was_here, .. }, Direction::Restore) => {
+                let note = if *was_here {
+                    "deleted at home"
+                } else {
+                    "new in the store"
+                };
+                plan.actions.push(copy(Op::Create, note.into()))
+            }
             (State::Conflict { home, store }, dir) => {
                 let text = format!(
                     "home has {}, store has {}",
@@ -478,12 +530,14 @@ pub struct Outcome {
     pub history_error: Option<String>,
 }
 
-/// Carry out a plan. `report` is called after each action with the result.
+/// Carry out a plan, keeping the index's baselines up to date. `report` is
+/// called after each action with the result.
 pub fn apply(
     plan: &Plan,
     layout: &Layout,
     mut backup: Option<Backup>,
     history: &History,
+    index: &mut Index,
     mut report: impl FnMut(&Action, Result<(), &str>),
 ) -> Result<Outcome> {
     let mut done = 0;
@@ -494,6 +548,21 @@ pub fn apply(
         match result {
             Ok(()) => {
                 done += 1;
+                match action.op {
+                    // Both sides now hold what was copied.
+                    Op::Create | Op::Overwrite => {
+                        match fsx::lstat(&action.dst)
+                            .ok()
+                            .flatten()
+                            .map(|m| index::fingerprint(&m))
+                        {
+                            Some(Ok(fp)) => index.synced(&action.rel, fp),
+                            _ => index.forget(&action.rel),
+                        }
+                    }
+                    Op::Remove => index.forget(&action.rel),
+                    Op::Chmod => {}
+                }
                 if let Err(e) = history.record(op_name(action, plan.kind), &action.rel)
                     && history_error.is_none()
                 {

@@ -45,6 +45,19 @@ impl History {
             .with_context(|| format!("cannot write {}", self.path.display()))
     }
 
+    /// Paths whose last recorded operation copied them one way or the
+    /// other: they were in sync on this machine at some point.
+    pub fn synced_paths(&self) -> Vec<Rel> {
+        let mut last: std::collections::BTreeMap<String, String> = Default::default();
+        for r in self.read().unwrap_or_default() {
+            last.insert(r.rel, r.op);
+        }
+        last.into_iter()
+            .filter(|(_, op)| op == "save" || op == "restore")
+            .filter_map(|(rel, _)| Rel::parse(&rel).ok())
+            .collect()
+    }
+
     /// All records, oldest first. Lines that cannot be parsed are skipped.
     pub fn read(&self) -> Result<Vec<Record>> {
         let text = match std::fs::read_to_string(&self.path) {

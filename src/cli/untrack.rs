@@ -9,6 +9,7 @@ use crate::ui;
 
 pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     ctx.require_store()?;
+    ctx.require_lock()?;
     let (rels, mut failures) = ctx.resolve_paths(paths);
 
     // Work out what each path means before touching anything.

@@ -495,7 +495,14 @@ fn symlinks_are_copied_as_symlinks() {
     assert!(text.contains("- ../real/theme.conf"), "{text}");
     assert!(text.contains("+ ../real/other.conf"), "{text}");
 
-    sb.ok(&["restore", "-y"]);
+    // The link changed at home: restore keeps that unless forced.
+    let text = sb.ok(&["restore", "-y"]);
+    assert!(text.contains("changed at home; left alone"), "{text}");
+    assert_eq!(
+        fs::read_link(sb.home_path(".config/theme.conf")).unwrap(),
+        PathBuf::from("../real/other.conf")
+    );
+    sb.ok(&["restore", "--force", "-y"]);
     assert_eq!(
         fs::read_link(sb.home_path(".config/theme.conf")).unwrap(),
         PathBuf::from("../real/theme.conf")
@@ -931,6 +938,166 @@ fn ignore_adds_patterns_and_offers_to_drop_matching_files() {
 }
 
 #[test]
+fn the_last_sync_decides_which_side_changed() {
+    let sb = Sandbox::ready();
+    sb.write_home(".zshrc", "one\n");
+    sb.write_home(".vimrc", "set nu\n");
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.ok(&["~/.zshrc", "~/.vimrc", "~/.config/app", "-y"]);
+
+    // Another machine's changes arrive in the store (a git pull, say), and
+    // this machine has an edit of its own.
+    sb.write_store(".zshrc", "two\n");
+    sb.write_store(".config/app/b.conf", "b\n");
+    sb.write_home(".vimrc", "set nonu\n");
+    let text = sb.ok(&["status"]);
+    assert!(
+        text.contains(".zshrc") && text.contains("changed in the store"),
+        "{text}"
+    );
+    assert!(
+        text.contains(".vimrc") && text.contains("changed at home"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- .config/app/b.conf") && text.contains("new in the store"),
+        "{text}"
+    );
+
+    // Saving takes home's edit and leaves the store's alone; the file from
+    // the other machine is not mistaken for one deleted at home.
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("~ .vimrc"), "{text}");
+    assert!(text.contains("changed in the store; left alone"), "{text}");
+    assert_eq!(sb.read_store(".vimrc"), "set nonu\n");
+    assert_eq!(sb.read_store(".zshrc"), "two\n");
+    assert!(sb.store_path(".config/app/b.conf").exists());
+
+    // Restoring brings the store's changes home.
+    sb.ok(&["restore", "-y"]);
+    assert_eq!(sb.read_home(".zshrc"), "two\n");
+    assert_eq!(sb.read_home(".config/app/b.conf"), "b\n");
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(0));
+
+    // Changed on both sides: a conflict until a side is picked.
+    sb.write_home(".zshrc", "three at home\n");
+    sb.write_store(".zshrc", "three in the store\n");
+    let text = sb.ok(&["status"]);
+    assert!(
+        text.contains("conflicts\n  ! .zshrc") && text.contains("changed at home and in the store"),
+        "{text}"
+    );
+    let text = sb.fail(&["-y"]);
+    assert!(text.contains("use --force"), "{text}");
+    sb.fail(&["restore", "-y"]);
+    assert_eq!(sb.read_home(".zshrc"), "three at home\n");
+    sb.ok(&["save", "--force", "~/.zshrc", "-y"]);
+    assert_eq!(sb.read_store(".zshrc"), "three at home\n");
+
+    // Deleted from the store elsewhere: not saved back unless forced.
+    fs::remove_file(sb.store_path(".config/app/a.conf")).unwrap();
+    let text = sb.ok(&["status"]);
+    assert!(
+        text.contains("deleted from the store, still at home\n  - .config/app/a.conf"),
+        "{text}"
+    );
+    let text = sb.ok(&["-y"]);
+    assert!(
+        text.contains("deleted from the store; not added back"),
+        "{text}"
+    );
+    assert!(!sb.store_path(".config/app/a.conf").exists());
+    sb.ok(&["save", "--force", "~/.config/app/a.conf", "-y"]);
+    assert!(sb.store_path(".config/app/a.conf").exists());
+
+    // Deleted at home after changing in the store: a conflict, not a removal.
+    fs::remove_file(sb.home_path(".config/app/b.conf")).unwrap();
+    sb.write_store(".config/app/b.conf", "b, edited elsewhere\n");
+    let text = sb.fail(&["-y"]);
+    assert!(
+        text.contains("deleted at home, changed in the store"),
+        "{text}"
+    );
+    assert!(sb.store_path(".config/app/b.conf").exists());
+}
+
+#[test]
+fn a_new_machine_never_mistakes_store_files_for_deletions() {
+    let sb = Sandbox::ready();
+    // A store cloned from another machine, tracking ~/.config/app...
+    let manifest = sb
+        .manifest()
+        .replace("dirs = [\n]", "dirs = [\n  \"~/.config/app\",\n]");
+    fs::write(sb.store_path(".cubby.toml"), manifest).unwrap();
+    sb.write_store(".config/app/settings.conf", "mine\n");
+    // ...where the app has already written a default config of its own.
+    sb.write_home(".config/app/default.conf", "default\n");
+
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("+ .config/app/default.conf"), "{text}");
+    assert!(!text.contains("- .config/app/settings.conf"), "{text}");
+    assert!(sb.store_path(".config/app/settings.conf").exists());
+    sb.ok(&["restore", "-y"]);
+    assert_eq!(sb.read_home(".config/app/settings.conf"), "mine\n");
+}
+
+#[test]
+fn upgrading_from_cubby_2_keeps_deletions_working() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.write_home(".config/app/b.conf", "b\n");
+    sb.ok(&["~/.config/app", "-y"]);
+    // What cubby 2 leaves behind: the store and a history log, no index.
+    let state = sb.home.join(".local/state/cubby");
+    fs::remove_dir_all(state.join("index")).unwrap();
+    fs::write(
+        state.join("history.log"),
+        "2026-01-01T00:00:00Z\tsave\t.config/app/a.conf\n\
+         2026-01-01T00:00:00Z\tsave\t.config/app/b.conf\n",
+    )
+    .unwrap();
+
+    fs::remove_file(sb.home_path(".config/app/b.conf")).unwrap();
+    let text = sb.ok(&["-y"]);
+    assert!(
+        text.contains("- .config/app/b.conf") && text.contains("deleted at home"),
+        "{text}"
+    );
+    assert!(!sb.store_path(".config/app/b.conf").exists());
+}
+
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+#[test]
+fn one_cubby_changes_files_at_a_time() {
+    use std::os::fd::AsRawFd;
+    let sb = Sandbox::ready();
+    sb.write_home(".zshrc", "z\n");
+    let state = sb.home.join(".local/state/cubby");
+    fs::create_dir_all(&state).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("lock"))
+        .unwrap();
+    // LOCK_EX | LOCK_NB, the same on Linux and macOS.
+    assert_eq!(unsafe { flock(lock.as_raw_fd(), 2 | 4) }, 0);
+
+    let text = sb.fail(&["~/.zshrc", "-y"]);
+    assert!(text.contains("another cubby is running"), "{text}");
+    assert!(!sb.store_path(".zshrc").exists());
+    // Looking, and dry runs, do not wait.
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(0));
+    sb.ok(&["~/.zshrc", "-n"]);
+    drop(lock);
+    sb.ok(&["~/.zshrc", "-y"]);
+    assert!(sb.store_path(".zshrc").exists());
+}
+
+#[test]
 fn history_lists_operations() {
     let sb = Sandbox::ready();
     let text = sb.ok(&["history"]);
@@ -1118,10 +1285,12 @@ fn paths_are_tracked_as_typed_through_symlinked_parents() {
     assert!(sb.store_path(".myapp/top.conf").exists());
     let text = sb.ok(&["status"]);
     assert!(text.contains("~ .myapp/sub/a.conf"), "{text}");
-    sb.ok(&["restore", "-y", "~/.myapp/sub"]);
-    // A restore over the symlinked path lands in the real directory.
+    // A restore over the symlinked path lands in the real directory (forced:
+    // the file changed on both sides).
     sb.write_store(".myapp/sub/a.conf", "from store\n");
-    sb.ok(&["restore", "-y", "~/.myapp/sub/a.conf"]);
+    let text = sb.fail(&["restore", "-y", "~/.myapp/sub/a.conf"]);
+    assert!(text.contains("changed at home and in the store"), "{text}");
+    sb.ok(&["restore", "--force", "-y", "~/.myapp/sub/a.conf"]);
     assert_eq!(sb.read_home("Dropbox/myapp/sub/a.conf"), "from store\n");
 
     // The real location is still what the store check looks at.

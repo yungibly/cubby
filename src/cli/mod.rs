@@ -19,10 +19,12 @@ use crate::backup::{self, Backup};
 use crate::config::{self, Config, Overrides};
 use crate::history::History;
 use crate::ignore::Ignore;
+use crate::index::Index;
+use crate::lock::Lock;
 use crate::manifest::Manifest;
 use crate::paths::Rel;
 use crate::perms;
-use crate::plan::{self, Op, Plan, Skip};
+use crate::plan::{self, Op, Plan, RunKind, Side, Skip};
 use crate::scan::{Scan, Scanner, Scope};
 use crate::ui::{self, ColorChoice, Style};
 
@@ -209,6 +211,20 @@ pub struct Ctx {
     pub dry_run: bool,
     pub yes: bool,
     pub verbose: bool,
+    /// Baselines and cached fingerprints for this store on this machine.
+    pub index: Index,
+    lock: LockState,
+}
+
+/// Whether this process may change files and the index.
+enum LockState {
+    Held(#[allow(dead_code)] Lock),
+    /// Another cubby holds the lock.
+    Busy,
+    /// Let go before paging output, so other commands can run meanwhile.
+    Released,
+    /// The state directory cannot be written; carry on without the lock.
+    Unavailable,
 }
 
 impl Ctx {
@@ -221,6 +237,15 @@ impl Ctx {
         let manifest = Manifest::load(&cfg.layout.store)?;
         let ignore = ignore_rules(&cfg, &manifest, &cfg.skip)?;
         let shared = ignore_rules(&cfg, &manifest, &[])?;
+        let lock = match Lock::try_acquire(&cfg.state_dir) {
+            Ok(Some(lock)) => LockState::Held(lock),
+            Ok(None) => LockState::Busy,
+            Err(_) => LockState::Unavailable,
+        };
+        let mut index = Index::load(&cfg.state_dir, &cfg.layout.store);
+        if !index.existed() {
+            index.import_legacy(History::new(&cfg.state_dir).synced_paths());
+        }
         Ok(Ctx {
             cfg,
             manifest,
@@ -231,7 +256,40 @@ impl Ctx {
             dry_run: global.dry_run,
             yes: global.yes,
             verbose: global.verbose,
+            index,
+            lock,
         })
+    }
+
+    /// Commands that change files run one at a time.
+    pub fn require_lock(&self) -> Result<()> {
+        if matches!(self.lock, LockState::Busy) && !self.dry_run {
+            bail!(
+                "another cubby is running (it holds {}); try again when it has finished",
+                self.cfg.layout.pretty(&self.cfg.state_dir.join("lock"))
+            );
+        }
+        Ok(())
+    }
+
+    /// Let other cubby processes run, for a command that is done with the
+    /// index (before paging output, say).
+    pub fn release_lock(&mut self) {
+        self.lock = LockState::Released;
+    }
+
+    fn may_write_index(&self) -> bool {
+        !self.dry_run && matches!(self.lock, LockState::Held(_) | LockState::Unavailable)
+    }
+
+    /// Remember what a scan found: baselines for paths that match and
+    /// fingerprints of files that were read. Failing to write the index
+    /// only costs a slower, less precise scan next time, so it is quiet.
+    pub fn learn(&mut self, scan: &Scan, scope: &Scope) {
+        if self.may_write_index() {
+            self.index.learn(scan, scope);
+            let _ = self.index.save();
+        }
     }
 
     /// A scanner that sees what this machine syncs.
@@ -256,6 +314,7 @@ impl Ctx {
             layout: &self.cfg.layout,
             manifest: &self.manifest,
             ignore,
+            index: &self.index,
             own,
         }
     }
@@ -413,45 +472,79 @@ impl Ctx {
 
     /// Print what a plan skipped and why.
     pub fn print_skipped(&self, plan: &Plan) {
-        let mut missing = 0;
+        let mut new_in_store = 0;
+        let mut deleted_here = 0;
         let mut new = 0;
+        let mut kept = Vec::new();
         for s in &plan.skipped {
+            let row = |symbol: &str, note: &str| {
+                println!("{}", ui::row(&self.style, symbol, s.rel.as_str(), note))
+            };
             match &s.why {
-                Skip::MissingAtHome => missing += 1,
+                Skip::MissingAtHome { was_here: false } => new_in_store += 1,
+                Skip::MissingAtHome { was_here: true } => deleted_here += 1,
                 Skip::NewAtHome => new += 1,
-                Skip::Conflict(text) => {
-                    println!(
-                        "{}",
-                        ui::row(
-                            &self.style,
-                            &self.style.red("!"),
-                            s.rel.as_str(),
-                            &format!("{text}; use --force to replace")
-                        )
-                    );
+                Skip::ChangedThere(Side::Store) => {
+                    row(&self.style.dim("·"), "changed in the store; left alone");
+                    kept.push(s);
                 }
-                Skip::Error(text) => {
-                    println!(
-                        "{}",
-                        ui::row(&self.style, &self.style.red("!"), s.rel.as_str(), text)
-                    );
+                Skip::ChangedThere(Side::Home) => {
+                    row(&self.style.dim("·"), "changed at home; left alone");
+                    kept.push(s);
                 }
+                Skip::DeletedFromStore => {
+                    row(
+                        &self.style.dim("·"),
+                        "deleted from the store; not added back",
+                    );
+                    kept.push(s);
+                }
+                Skip::Conflict(text) => row(
+                    &self.style.red("!"),
+                    &format!("{text}; use --force to replace"),
+                ),
+                Skip::Error(text) => row(&self.style.red("!"), text),
             }
         }
-        if missing > 0 {
+        let is_are = |n: usize| if n == 1 { "is" } else { "are" };
+        let it_them = |n: usize| if n == 1 { "it" } else { "them" };
+        if new_in_store > 0 {
             self.note(&format!(
-                "  {} in the store {} not at home (run `cubby restore` to bring {} back)",
-                ui::plural(missing, "file", "files"),
-                if missing == 1 { "is" } else { "are" },
-                if missing == 1 { "it" } else { "them" },
+                "  {} in the store {} not at home (run `cubby restore` to bring {} over)",
+                ui::plural(new_in_store, "file", "files"),
+                is_are(new_in_store),
+                it_them(new_in_store),
+            ));
+        }
+        if deleted_here > 0 {
+            self.note(&format!(
+                "  {} deleted at home {} still in the store (`cubby untrack` drops {}, `cubby restore` brings {} back)",
+                ui::plural(deleted_here, "file", "files"),
+                is_are(deleted_here),
+                it_them(deleted_here),
+                it_them(deleted_here),
             ));
         }
         if new > 0 {
             self.note(&format!(
                 "  {} at home {} not in the store yet (run `cubby` to save {})",
                 ui::plural(new, "file", "files"),
-                if new == 1 { "is" } else { "are" },
-                if new == 1 { "it" } else { "them" },
+                is_are(new),
+                it_them(new),
+            ));
+        }
+        if !kept.is_empty() {
+            let hint = match plan.kind {
+                RunKind::Restore => {
+                    "`cubby` saves home's changes; `cubby restore --force PATH` replaces them"
+                }
+                _ => {
+                    "`cubby restore` brings the store's changes home; `cubby save --force PATH` replaces them"
+                }
+            };
+            self.note(&format!(
+                "  {} changed since the last sync left alone: {hint}",
+                ui::plural(kept.len(), "path", "paths")
             ));
         }
     }
@@ -474,27 +567,32 @@ impl Ctx {
     }
 
     /// Carry out a plan: back up, apply, report. Returns the exit code.
-    pub fn run_plan(&self, plan: &Plan) -> Result<i32> {
+    pub fn run_plan(&mut self, plan: &Plan) -> Result<i32> {
         let backup = self
             .cfg
             .backups
             .then(|| Backup::new(&self.cfg.state_dir, plan.kind.verb()));
         let history = self.history();
+        let style = self.style;
         // The plan was already printed; only failures need a line of their own.
         let outcome = plan::apply(
             plan,
             &self.cfg.layout,
             backup,
             &history,
+            &mut self.index,
             |action, result| {
                 if let Err(msg) = result {
                     println!(
                         "{}",
-                        ui::row(&self.style, &self.style.red("✗"), action.rel.as_str(), msg)
+                        ui::row(&style, &style.red("✗"), action.rel.as_str(), msg)
                     );
                 }
             },
         )?;
+        if let Err(e) = self.index.save() {
+            self.warn(&format!("could not update the index: {e:#}"));
+        }
 
         let mut summary = plan
             .kind
@@ -596,20 +694,20 @@ fn dispatch(cli: Cli) -> Result<i32> {
             save::run(&mut ctx, &paths, force)
         }
         Some(Command::Restore { paths, force }) => {
-            let ctx = Ctx::load(&global)?;
-            restore::run(&ctx, &paths, force)
+            let mut ctx = Ctx::load(&global)?;
+            restore::run(&mut ctx, &paths, force)
         }
         Some(Command::Status { paths, quiet }) => {
-            let ctx = Ctx::load(&global)?;
-            status::run(&ctx, &paths, quiet)
+            let mut ctx = Ctx::load(&global)?;
+            status::run(&mut ctx, &paths, quiet)
         }
         Some(Command::Diff {
             paths,
             reverse,
             no_pager,
         }) => {
-            let ctx = Ctx::load(&global)?;
-            diff::run(&ctx, &paths, reverse, no_pager)
+            let mut ctx = Ctx::load(&global)?;
+            diff::run(&mut ctx, &paths, reverse, no_pager)
         }
         Some(Command::List { plain }) => {
             let ctx = Ctx::load(&global)?;

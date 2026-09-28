@@ -4,12 +4,14 @@ use super::Ctx;
 use crate::plan::{self, Direction, Op};
 use crate::ui;
 
-pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
+pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     ctx.require_store()?;
+    ctx.require_lock()?;
     let Some((scope, mut failures)) = ctx.scope_for(paths) else {
         return Ok(1);
     };
     let scan = ctx.scanner().scan(&scope)?;
+    ctx.learn(&scan, &scope);
     failures += ctx.report_unstored(&scope, &scan);
 
     let plan = plan::plan(

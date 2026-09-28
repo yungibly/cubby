@@ -5,6 +5,8 @@ mod diff;
 mod fsx;
 mod history;
 mod ignore;
+mod index;
+mod lock;
 mod manifest;
 mod paths;
 mod perms;

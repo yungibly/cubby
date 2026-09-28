@@ -5,6 +5,10 @@
 //! beneath the directories listed in the manifest. That is what makes "new
 //! at home" a meaningful state: cubby only looks for new files where you
 //! told it to.
+//!
+//! Files are compared by fingerprint, and each side is compared with the
+//! baseline in the [`Index`] (what both sides held the last time they
+//! matched) to tell which side changed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -16,13 +20,18 @@ use walkdir::WalkDir;
 
 use crate::fsx::{self, Kind, Meta};
 use crate::ignore::Ignore;
+use crate::index::{self, Base, Fp, Index};
 use crate::manifest::Manifest;
-use crate::paths::{Layout, Rel};
+use crate::paths::{Layout, Rel, Side};
 
+/// Which side of a modified path changed since the last sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Newer {
+pub enum Change {
     Home,
     Store,
+    Both,
+    /// No record of the last sync (a new machine, or a path cubby has not
+    /// seen both sides of).
     Unknown,
 }
 
@@ -31,13 +40,21 @@ pub enum State {
     /// Identical on both sides.
     Same,
     /// Present on both sides with different content (or executable bit).
-    Modified(Newer),
+    Modified(Change),
     /// Only at home. Under a tracked directory this means "not saved yet";
-    /// elsewhere it means "not tracked".
-    New,
-    /// Only in the store. `deleted` is true when it lies under a tracked
-    /// directory that exists at home, meaning it was deleted there.
-    Missing { deleted: bool },
+    /// elsewhere it means "not tracked". `was_stored`: it was in the store
+    /// at the last sync, so it has been deleted from the store since.
+    New { was_stored: bool },
+    /// Only in the store.
+    Missing {
+        /// It was at home at the last sync, so it was deleted at home.
+        was_here: bool,
+        /// It lies under a tracked directory that exists at home, so a
+        /// deletion there is one to mirror.
+        under_present_dir: bool,
+        /// The store copy changed since the last sync.
+        store_changed: bool,
+    },
     /// Present on both sides but as different kinds of thing.
     Conflict { home: Kind, store: Kind },
     /// Could not be compared, or could not be read.
@@ -47,6 +64,12 @@ pub enum State {
 impl State {
     pub fn is_same(&self) -> bool {
         matches!(self, State::Same)
+    }
+
+    /// A new file that is not tracked: at home, outside tracked
+    /// directories, named on the command line.
+    pub fn is_untracked(&self, dir: Option<&Rel>) -> bool {
+        matches!(self, State::New { .. }) && dir.is_none()
     }
 }
 
@@ -58,6 +81,9 @@ pub struct Entry {
     pub store: Option<Meta>,
     /// The tracked directory this path lies under, if any.
     pub dir: Option<Rel>,
+    /// Fingerprints, where they were read or cached.
+    pub home_fp: Option<Fp>,
+    pub store_fp: Option<Fp>,
 }
 
 /// A tracked file or directory whose permissions at home differ from what
@@ -152,6 +178,8 @@ pub struct Scanner<'a> {
     pub layout: &'a Layout,
     pub manifest: &'a Manifest,
     pub ignore: &'a Ignore,
+    /// Baselines and cached fingerprints.
+    pub index: &'a Index,
     /// Device and inode of the store, cubby's state directory, and its
     /// config file: never walked into or copied, even through a symlinked
     /// path that the ignore rules would not recognise.
@@ -227,13 +255,17 @@ impl Scanner<'_> {
             let home = home_side.get(rel);
             let store = store_side.get(rel);
             let dir = self.manifest.dir_for(rel).cloned();
-            let state = classify(home, store, dir.as_ref(), &present_dirs);
+            let under_present_dir = dir.as_ref().is_some_and(|d| present_dirs.contains(d));
+            let base = self.index.base(rel);
+            let c = self.classify(rel, home, store, base, under_present_dir);
             entries.push(Entry {
                 rel: rel.clone(),
-                state,
+                state: c.state,
                 home: home.cloned(),
                 store: store.cloned(),
                 dir,
+                home_fp: c.home_fp,
+                store_fp: c.store_fp,
             });
         }
 
@@ -480,42 +512,128 @@ fn lossy(base: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-fn classify(
-    home: Option<&Meta>,
-    store: Option<&Meta>,
-    dir: Option<&Rel>,
-    present_dirs: &[Rel],
-) -> State {
-    match (home, store) {
-        (Some(h), Some(s)) if h.kind != s.kind => State::Conflict {
-            home: h.kind,
-            store: s.kind,
-        },
-        (Some(h), Some(s)) => {
-            let equal = match h.kind {
-                Kind::Symlink => h.target == s.target,
-                _ => {
-                    if h.is_executable() != s.is_executable() {
-                        false
-                    } else {
-                        match fsx::same_content(&h.path, h, &s.path, s) {
-                            Ok(eq) => eq,
-                            Err(e) => return State::Error(format!("{e:#}")),
-                        }
-                    }
+/// A path's state, with the fingerprints read or cached on the way.
+struct Classified {
+    state: State,
+    home_fp: Option<Fp>,
+    store_fp: Option<Fp>,
+}
+
+impl Classified {
+    fn state(state: State) -> Classified {
+        Classified {
+            state,
+            home_fp: None,
+            store_fp: None,
+        }
+    }
+}
+
+impl Scanner<'_> {
+    fn classify(
+        &self,
+        rel: &Rel,
+        home: Option<&Meta>,
+        store: Option<&Meta>,
+        base: Base,
+        under_present_dir: bool,
+    ) -> Classified {
+        match (home, store) {
+            (Some(h), Some(s)) if h.kind != s.kind => Classified::state(State::Conflict {
+                home: h.kind,
+                store: s.kind,
+            }),
+            (Some(h), Some(s)) => self.compare(rel, h, s, base),
+            (Some(h), None) => Classified::state(unreadable(h).unwrap_or(State::New {
+                was_stored: base.exists(),
+            })),
+            (None, Some(s)) => {
+                if let Some(e) = unreadable(s) {
+                    return Classified::state(e);
                 }
+                // Changed in the store since it was deleted at home?
+                let mut store_fp = None;
+                let store_changed = match base {
+                    Base::Is(b) => match self.fingerprint(rel, Side::Store, s) {
+                        Ok(fp) => {
+                            store_fp = Some(fp);
+                            fp != b
+                        }
+                        Err(e) => return Classified::state(State::Error(e)),
+                    },
+                    _ => false,
+                };
+                Classified {
+                    state: State::Missing {
+                        was_here: base.exists(),
+                        under_present_dir,
+                        store_changed,
+                    },
+                    home_fp: None,
+                    store_fp,
+                }
+            }
+            (None, None) => Classified::state(State::Error("vanished during scan".into())),
+        }
+    }
+
+    /// Compare two paths of the same kind by fingerprint, reading only what
+    /// the index has no fingerprint for.
+    fn compare(&self, rel: &Rel, h: &Meta, s: &Meta, base: Base) -> Classified {
+        let mut home_fp = self.index.cached(rel, Side::Home, h);
+        let mut store_fp = self.index.cached(rel, Side::Store, s);
+        // Files of different sizes differ; without a baseline to tell which
+        // side changed, there is no need to read them.
+        if h.kind == Kind::File
+            && h.len != s.len
+            && !matches!(base, Base::Is(_))
+            && (home_fp.is_none() || store_fp.is_none())
+        {
+            return Classified {
+                state: State::Modified(Change::Unknown),
+                home_fp,
+                store_fp,
             };
-            if equal {
-                State::Same
-            } else {
-                State::Modified(newer(h, s))
+        }
+        if fsx::same_inode(h, s) && home_fp.is_none() {
+            home_fp = store_fp;
+        }
+        for (fp, side, meta) in [
+            (&mut home_fp, Side::Home, h),
+            (&mut store_fp, Side::Store, s),
+        ] {
+            if fp.is_none() {
+                match self.fingerprint(rel, side, meta) {
+                    Ok(f) => *fp = Some(f),
+                    Err(e) => return Classified::state(State::Error(e)),
+                }
             }
         }
-        (Some(h), None) => unreadable(h).unwrap_or(State::New),
-        (None, Some(s)) => unreadable(s).unwrap_or(State::Missing {
-            deleted: dir.is_some_and(|d| present_dirs.contains(d)),
-        }),
-        (None, None) => State::Error("vanished during scan".into()),
+        let (hf, sf) = (home_fp.expect("read above"), store_fp.expect("read above"));
+        let state = if hf == sf {
+            State::Same
+        } else {
+            State::Modified(match base {
+                Base::Is(b) if b == hf => Change::Store,
+                Base::Is(b) if b == sf => Change::Home,
+                Base::Is(_) => Change::Both,
+                Base::None | Base::Seen => Change::Unknown,
+            })
+        };
+        Classified {
+            state,
+            home_fp,
+            store_fp,
+        }
+    }
+
+    /// A path's fingerprint: cached when its metadata has not changed, read
+    /// otherwise. Errors are for showing next to the path.
+    fn fingerprint(&self, rel: &Rel, side: Side, meta: &Meta) -> Result<Fp, String> {
+        if let Some(fp) = self.index.cached(rel, side, meta) {
+            return Ok(fp);
+        }
+        index::fingerprint(meta).map_err(|e| format!("cannot read: {}", e.root_cause()))
     }
 }
 
@@ -528,18 +646,4 @@ fn unreadable(meta: &Meta) -> Option<State> {
     File::open(&meta.path)
         .err()
         .map(|e| State::Error(format!("cannot read: {e}")))
-}
-
-fn newer(home: &Meta, store: &Meta) -> Newer {
-    let secs = |m: &Meta| {
-        m.mtime
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    };
-    match secs(home).cmp(&secs(store)) {
-        std::cmp::Ordering::Greater => Newer::Home,
-        std::cmp::Ordering::Less => Newer::Store,
-        std::cmp::Ordering::Equal => Newer::Unknown,
-    }
 }

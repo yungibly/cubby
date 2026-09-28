@@ -30,6 +30,7 @@ pub fn run(ctx: &mut Ctx, patterns: &[String], here: bool, remove: bool) -> Resu
         skip_here(ctx, &patterns, remove)
     } else {
         ctx.require_store()?;
+        ctx.require_lock()?;
         everywhere(ctx, &patterns, remove)
     }
 }
