@@ -81,6 +81,20 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     for d in &dirs_to_drop {
         manifest_changed |= ctx.manifest.remove_dir(d);
     }
+    // Permission records for what left the store go with it: records of
+    // untracked files, and of directories that no longer hold anything.
+    let remaining = ctx.scanner().store_entries()?;
+    let stale: Vec<Rel> = ctx
+        .manifest
+        .modes
+        .keys()
+        .filter(|r| scope_rels.iter().any(|s| r.is_within(s) || s.is_within(r)))
+        .filter(|r| !remaining.iter().any(|(rel, _)| rel.is_within(r)))
+        .cloned()
+        .collect();
+    for r in stale {
+        manifest_changed |= ctx.manifest.set_mode(&r, None);
+    }
     if manifest_changed {
         ctx.manifest.save(&ctx.cfg.layout.store)?;
     }

@@ -12,7 +12,13 @@ pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
     let scan = ctx.scanner().scan(&scope)?;
     failures += ctx.report_unstored(&scope, &scan);
 
-    let plan = plan::plan(&scan, &ctx.cfg.layout, Direction::Restore, force);
+    let plan = plan::plan(
+        &scan,
+        &ctx.cfg.layout,
+        &ctx.manifest.modes,
+        Direction::Restore,
+        force,
+    );
     failures += plan.troubled();
     for n in &scan.notes {
         ctx.warn(&format!("{}: {}", n.path, n.why));
@@ -29,14 +35,25 @@ pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
     ctx.print_skipped(&plan);
     let created = plan.count(Op::Create);
     let overwritten = plan.count(Op::Overwrite);
-    let mut summary = ui::plural(created, "file to create", "files to create");
+    let chmods = plan.count(Op::Chmod);
+    let mut parts = Vec::new();
+    if created > 0 || (overwritten == 0 && chmods == 0) {
+        parts.push(ui::plural(created, "file to create", "files to create"));
+    }
     if overwritten > 0 {
-        summary.push_str(&format!(
-            ", {}",
-            ui::plural(overwritten, "file to overwrite", "files to overwrite")
+        parts.push(ui::plural(
+            overwritten,
+            "file to overwrite",
+            "files to overwrite",
         ));
     }
-    ctx.note(&format!("  {summary}"));
+    if chmods > 0 {
+        parts.push(format!(
+            "permissions of {} to tighten",
+            ui::plural(chmods, "path", "paths")
+        ));
+    }
+    ctx.note(&format!("  {}", parts.join(", ")));
 
     if ctx.dry_run {
         ctx.note("dry run, nothing changed");
@@ -44,7 +61,7 @@ pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
     }
     if !ctx.confirm(&format!(
         "restore {}?",
-        ui::plural(plan.actions.len(), "file", "files")
+        ui::plural(plan.actions.len(), "change", "changes")
     ))? {
         ctx.note("aborted");
         return Ok(1);

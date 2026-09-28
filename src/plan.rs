@@ -1,19 +1,23 @@
 //! Turn a scan into a list of actions, and carry them out.
 //!
 //! `save` copies home → store and, under tracked directories, removes store
-//! files that were deleted at home. `restore` copies store → home and never
-//! removes anything. `untrack` removes files from the store. All of them
-//! back up whatever they overwrite or remove.
+//! files that were deleted at home; it also records the permissions of
+//! private files in the manifest. `restore` copies store → home, applies
+//! recorded permissions, and never removes anything. `untrack` removes
+//! files from the store. All of them back up whatever they overwrite or
+//! remove.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::backup::Backup;
-use crate::fsx;
+use crate::fsx::{self, Kind, Perms};
 use crate::history::History;
 use crate::paths::{Layout, Rel};
-use crate::scan::{Newer, Scan, State};
+use crate::perms;
+use crate::scan::{Entry, Newer, Scan, State};
 
 /// Which way a save or restore copies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +95,8 @@ pub enum Op {
     Overwrite,
     /// Remove the destination.
     Remove,
+    /// Change the destination's permissions.
+    Chmod,
 }
 
 #[derive(Clone, Debug)]
@@ -101,12 +107,26 @@ pub struct Action {
     pub side: Side,
     /// Short explanation shown next to the path.
     pub note: String,
-    /// Where to copy from (absent for removals).
+    /// Where to copy from (absent for removals and permission changes).
     pub src: Option<PathBuf>,
-    /// The path that gets written or removed.
+    /// The path that gets written, removed, or changed.
     pub dst: PathBuf,
-    /// Bytes copied (zero for removals).
+    /// Bytes copied (zero unless copying).
     pub len: u64,
+    /// For copies: permissions to take away from the copy and from any
+    /// directories created for it.
+    pub perms: Perms,
+    /// For permission changes: the new permission bits.
+    pub mode: Option<u32>,
+}
+
+/// A change to the permissions the manifest records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModeRecord {
+    pub rel: Rel,
+    pub is_dir: bool,
+    pub from: Option<u32>,
+    pub to: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +151,8 @@ pub struct Plan {
     pub kind: RunKind,
     pub actions: Vec<Action>,
     pub skipped: Vec<Skipped>,
+    /// Permission records to write to the manifest.
+    pub records: Vec<ModeRecord>,
 }
 
 impl Plan {
@@ -139,11 +161,12 @@ impl Plan {
             kind,
             actions: Vec::new(),
             skipped: Vec::new(),
+            records: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.actions.is_empty()
+        self.actions.is_empty() && self.records.is_empty()
     }
 
     pub fn count(&self, op: Op) -> usize {
@@ -163,10 +186,31 @@ impl Plan {
             .filter(|s| matches!(s.why, Skip::Conflict(_) | Skip::Error(_)))
             .count()
     }
+
+    /// Records with no action of their own to show them (the note of a
+    /// file's copy mentions its record): each is a change of its own.
+    pub fn standalone_records(&self) -> impl Iterator<Item = &ModeRecord> {
+        self.records
+            .iter()
+            .filter(|r| !self.actions.iter().any(|a| a.rel == r.rel))
+    }
+
+    /// Paths whose recorded permissions this plan sets, not counting the
+    /// records dropped along with a file removed from the store.
+    pub fn records_set(&self) -> usize {
+        self.records.iter().filter(|r| r.to.is_some()).count()
+    }
 }
 
-/// Plan a save or a restore of everything in `scan`.
-pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> Plan {
+/// Plan a save or a restore of everything in `scan`. `modes` are the
+/// permissions the manifest records.
+pub fn plan(
+    scan: &Scan,
+    layout: &Layout,
+    modes: &BTreeMap<Rel, u32>,
+    direction: Direction,
+    force: bool,
+) -> Plan {
     let kind = match direction {
         Direction::Save => RunKind::Save,
         Direction::Restore => RunKind::Restore,
@@ -211,6 +255,8 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
                 src: Some(src),
                 dst,
                 len: src_meta.map_or(0, |m| m.len),
+                perms: copy_perms(e, scan, layout, modes, direction),
+                mode: None,
             }
         };
         match (&e.state, direction) {
@@ -234,6 +280,8 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
                 src: None,
                 dst: store_path.clone(),
                 len: 0,
+                perms: Perms::default(),
+                mode: None,
             }),
             (State::Missing { deleted: false }, Direction::Save) => {
                 plan.skipped.push(skip(Skip::MissingAtHome))
@@ -247,8 +295,7 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
                     home.describe(),
                     store.describe()
                 );
-                let replaceable =
-                    !matches!(home, fsx::Kind::Dir) && !matches!(store, fsx::Kind::Dir);
+                let replaceable = !matches!(home, Kind::Dir) && !matches!(store, Kind::Dir);
                 if force && replaceable {
                     let note = match dir {
                         Direction::Save => format!("{text}; replacing the store copy"),
@@ -262,7 +309,135 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
             (State::Error(msg), _) => plan.skipped.push(skip(Skip::Error(msg.clone()))),
         }
     }
+    match direction {
+        Direction::Save => plan_records(&mut plan, scan, modes, force),
+        Direction::Restore => plan_chmods(&mut plan, scan),
+    }
     plan
+}
+
+/// How a copy of `e` treats permissions. Saving keeps a private file (and
+/// the private directories around it) private in the store too; restoring
+/// applies what the manifest records.
+fn copy_perms(
+    e: &Entry,
+    scan: &Scan,
+    layout: &Layout,
+    modes: &BTreeMap<Rel, u32>,
+    direction: Direction,
+) -> Perms {
+    match direction {
+        Direction::Save => Perms {
+            restrict: e
+                .home
+                .as_ref()
+                .filter(|m| m.kind == Kind::File && perms::is_private(m.mode))
+                .map(|m| m.mode & 0o777),
+            dirs: e
+                .rel
+                .ancestors()
+                .filter_map(|d| {
+                    let mode = *scan.dir_modes.get(&d)?;
+                    perms::is_private(mode).then(|| (layout.stored(&d), mode))
+                })
+                .collect(),
+        },
+        Direction::Restore => Perms {
+            restrict: modes.get(&e.rel).copied(),
+            dirs: e
+                .rel
+                .ancestors()
+                .filter_map(|d| Some((layout.live(&d), *modes.get(&d)?)))
+                .collect(),
+        },
+    }
+}
+
+/// The permission records a save writes: private modes of files on both
+/// sides, of files it copies, and of the directories holding them; and
+/// records dropped for files it removes. A file's record is also mentioned
+/// in the note of its copy.
+fn plan_records(plan: &mut Plan, scan: &Scan, modes: &BTreeMap<Rel, u32>, force: bool) {
+    let mut records: BTreeMap<Rel, ModeRecord> = BTreeMap::new();
+    let mut add = |rel: &Rel, is_dir: bool, from: Option<u32>, to: Option<u32>| {
+        if to != from {
+            records.entry(rel.clone()).or_insert(ModeRecord {
+                rel: rel.clone(),
+                is_dir,
+                from,
+                to,
+            });
+        }
+    };
+    for p in &scan.perms {
+        add(
+            &p.rel,
+            p.is_dir,
+            p.recorded,
+            perms::after_save(p.home, p.recorded, force),
+        );
+    }
+    for a in &plan.actions {
+        let from = modes.get(&a.rel).copied();
+        if a.op == Op::Remove {
+            add(&a.rel, false, from, None);
+            continue;
+        }
+        if let Ok(i) = scan.entries.binary_search_by(|e| e.rel.cmp(&a.rel))
+            && let Some(h) = &scan.entries[i].home
+        {
+            let to = match h.kind {
+                Kind::File => perms::after_save(h.mode, from, force),
+                _ => None,
+            };
+            add(&a.rel, false, from, to);
+        }
+        for d in a.rel.ancestors() {
+            if let Some(mode) = scan.dir_modes.get(&d) {
+                let from = modes.get(&d).copied();
+                add(&d, true, from, perms::after_save(*mode, from, force));
+            }
+        }
+    }
+    for a in &mut plan.actions {
+        if a.op != Op::Remove
+            && let Some(r) = records.get(&a.rel)
+        {
+            match r.to {
+                Some(to) => a
+                    .note
+                    .push_str(&format!(", permissions {}", perms::show(to))),
+                None => a.note.push_str(", forget recorded permissions"),
+            }
+        }
+    }
+    plan.records = records.into_values().collect();
+}
+
+/// Permission changes a restore makes at home: whatever is looser than the
+/// manifest records, unless a copy of that file already takes care of it.
+fn plan_chmods(plan: &mut Plan, scan: &Scan) {
+    let copied: Vec<Rel> = plan.actions.iter().map(|a| a.rel.clone()).collect();
+    for p in scan.perms.iter().filter(|p| p.needs_chmod()) {
+        if !p.is_dir && copied.contains(&p.rel) {
+            continue;
+        }
+        plan.actions.push(Action {
+            rel: p.rel.clone(),
+            op: Op::Chmod,
+            side: Side::Home,
+            note: format!(
+                "permissions {} → {}",
+                perms::show(p.home),
+                perms::show(p.restored)
+            ),
+            src: None,
+            dst: p.path.clone(),
+            len: 0,
+            perms: Perms::default(),
+            mode: Some(p.restored),
+        });
+    }
 }
 
 /// Plan removing every file of `scan` from the store.
@@ -278,6 +453,8 @@ pub fn untrack_plan(scan: &Scan) -> Plan {
                 src: None,
                 dst: m.path.clone(),
                 len: 0,
+                perms: Perms::default(),
+                mode: None,
             });
         }
     }
@@ -341,6 +518,7 @@ fn op_name(action: &Action, kind: RunKind) -> &'static str {
     match (action.op, action.side, kind) {
         (Op::Remove, _, RunKind::Untrack) => "untrack",
         (Op::Remove, _, _) => "remove",
+        (Op::Chmod, _, _) => "chmod",
         (_, Side::Store, _) => "save",
         (_, Side::Home, _) => "restore",
     }
@@ -362,6 +540,10 @@ fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Res
             }
             fsx::remove_entry(&action.dst, root)
         }
+        Op::Chmod => {
+            let mode = action.mode.ok_or_else(|| anyhow!("no mode for {rel}"))?;
+            fsx::chmod(&action.dst, mode)
+        }
         Op::Create | Op::Overwrite => {
             let src = action
                 .src
@@ -376,7 +558,13 @@ fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Res
                 b.stash(rel, &action.dst, d)
                     .with_context(|| format!("cannot back up {}", action.dst.display()))?;
             }
-            fsx::copy_entry(src, &src_meta, &action.dst, dst_meta.as_ref())
+            fsx::copy_entry(
+                src,
+                &src_meta,
+                &action.dst,
+                dst_meta.as_ref(),
+                &action.perms,
+            )
         }
     }
 }

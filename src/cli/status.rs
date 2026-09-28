@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use super::Ctx;
+use crate::perms;
 use crate::scan::{Newer, State};
 use crate::ui;
 
@@ -77,11 +78,33 @@ pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
         }
     }
 
-    let sections: [(&str, &Vec<String>); 6] = [
+    let mut permissions = Vec::new();
+    let (mut to_record, mut to_tighten) = (0, 0);
+    for p in &scan.perms {
+        let path = if p.is_dir {
+            format!("{}/", p.rel.as_str())
+        } else {
+            p.rel.as_str().to_owned()
+        };
+        let recorded = p.recorded.map_or("not recorded yet".to_owned(), |r| {
+            format!("{} recorded", perms::show(r))
+        });
+        permissions.push(ui::row(
+            style,
+            &style.yellow("~"),
+            &path,
+            &format!("{} at home, {recorded}", perms::show(p.home)),
+        ));
+        to_record += usize::from(p.needs_record());
+        to_tighten += usize::from(p.needs_chmod());
+    }
+
+    let sections: [(&str, &Vec<String>); 7] = [
         ("modified", &modified),
         ("new at home, not saved yet", &new),
         ("not tracked", &untracked),
         ("in the store, missing at home", &missing),
+        ("permissions", &permissions),
         ("conflicts", &conflicts),
         ("errors", &errors),
     ];
@@ -133,7 +156,12 @@ pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
         println!("{}", ui::row(style, &style.yellow("!"), &n.path, &n.why));
     }
 
-    let changes = modified.len() + new.len() + missing.len() + conflicts.len() + errors.len();
+    let changes = modified.len()
+        + new.len()
+        + missing.len()
+        + permissions.len()
+        + conflicts.len()
+        + errors.len();
     if changes == 0 && scan.absent_dirs.is_empty() && scan.empty_dirs.is_empty() {
         let what = if scope.is_all() {
             format!(
@@ -156,6 +184,9 @@ pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
         if !missing.is_empty() {
             parts.push(format!("{} missing", missing.len()));
         }
+        if !permissions.is_empty() {
+            parts.push(ui::plural(permissions.len(), "permission", "permissions"));
+        }
         if !conflicts.is_empty() {
             parts.push(ui::plural(conflicts.len(), "conflict", "conflicts"));
         }
@@ -165,10 +196,10 @@ pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
         parts.push(format!("{same} up to date"));
         println!("{}", style.dim(&parts.join(" · ")));
         let mut hints = Vec::new();
-        if !modified.is_empty() || !new.is_empty() {
+        if !modified.is_empty() || !new.is_empty() || to_record > 0 {
             hints.push("`cubby` saves home → store");
         }
-        if !modified.is_empty() || !missing.is_empty() {
+        if !modified.is_empty() || !missing.is_empty() || to_tighten > 0 {
             hints.push("`cubby restore` copies store → home");
         }
         if !hints.is_empty() {
@@ -189,6 +220,7 @@ fn run_quiet(ctx: &Ctx, paths: &[String]) -> Result<i32> {
         .iter()
         .any(|e| !e.state.is_same() && !(matches!(e.state, State::New) && e.dir.is_none()))
         || !scan.absent_dirs.is_empty()
-        || !scan.empty_dirs.is_empty();
+        || !scan.empty_dirs.is_empty()
+        || !scan.perms.is_empty();
     Ok(if dirty { 1 } else { 0 })
 }

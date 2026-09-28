@@ -140,6 +140,16 @@ fn read_full(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
+/// How a copy treats permissions beyond the usual rules.
+#[derive(Clone, Debug, Default)]
+pub struct Perms {
+    /// Take away the group and other permissions this mode does not grant
+    /// (see [`crate::perms`]).
+    pub restrict: Option<u32>,
+    /// The same, for parent directories the copy has to create.
+    pub dirs: Vec<(PathBuf, u32)>,
+}
+
 /// Copy a file or symlink from `src` to `dst`, replacing whatever is at
 /// `dst` atomically. Directories at `dst` are never replaced.
 ///
@@ -148,8 +158,14 @@ fn read_full(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 /// executable bits, which follow the source. That keeps a locked-down file
 /// (say, mode 600) locked down when the store copy came from a git clone
 /// that only remembers the executable bit, while still propagating
-/// `chmod +x`.
-pub fn copy_entry(src: &Path, src_meta: &Meta, dst: &Path, dst_meta: Option<&Meta>) -> Result<()> {
+/// `chmod +x`. `perms` can then take group and other access away.
+pub fn copy_entry(
+    src: &Path,
+    src_meta: &Meta,
+    dst: &Path,
+    dst_meta: Option<&Meta>,
+    perms: &Perms,
+) -> Result<()> {
     if let Some(d) = dst_meta {
         if same_inode(src_meta, d) {
             bail!("{} and {} are the same file", src.display(), dst.display());
@@ -159,11 +175,10 @@ pub fn copy_entry(src: &Path, src_meta: &Meta, dst: &Path, dst_meta: Option<&Met
         }
     }
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
+        create_dirs(parent, &perms.dirs)?;
     }
     match src_meta.kind {
-        Kind::File => copy_file(src, src_meta, dst, dst_meta),
+        Kind::File => copy_file(src, src_meta, dst, dst_meta, perms.restrict),
         Kind::Symlink => {
             let target = src_meta
                 .target
@@ -175,7 +190,13 @@ pub fn copy_entry(src: &Path, src_meta: &Meta, dst: &Path, dst_meta: Option<&Met
     }
 }
 
-fn copy_file(src: &Path, src_meta: &Meta, dst: &Path, dst_meta: Option<&Meta>) -> Result<()> {
+fn copy_file(
+    src: &Path,
+    src_meta: &Meta,
+    dst: &Path,
+    dst_meta: Option<&Meta>,
+    restrict: Option<u32>,
+) -> Result<()> {
     let dir = dst
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent", dst.display()))?;
@@ -193,6 +214,7 @@ fn copy_file(src: &Path, src_meta: &Meta, dst: &Path, dst_meta: Option<&Meta>) -
         }
         _ => src_meta.mode,
     };
+    let mode = restrict.map_or(mode, |r| crate::perms::restrict(mode, r));
     let file = tmp.as_file_mut();
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     // Preserve the modification time so "which side is newer" stays
@@ -202,6 +224,34 @@ fn copy_file(src: &Path, src_meta: &Meta, dst: &Path, dst_meta: Option<&Meta>) -
     tmp.persist(dst)
         .map_err(|e| anyhow!("cannot replace {}: {}", dst.display(), e.error))?;
     Ok(())
+}
+
+/// Create `dir` and any missing parents. Each directory created that has an
+/// entry in `modes` loses the group and other permissions its mode does not
+/// grant; directories that already existed are left alone.
+pub fn create_dirs(dir: &Path, modes: &[(PathBuf, u32)]) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut d = Some(dir);
+    while let Some(p) = d
+        && fs::symlink_metadata(p).is_err()
+    {
+        missing.push(p.to_path_buf());
+        d = p.parent();
+    }
+    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    for m in missing {
+        if let Some((_, mode)) = modes.iter().find(|(p, _)| *p == m) {
+            let current = fs::metadata(&m)?.mode() & 0o7777;
+            chmod(&m, crate::perms::restrict(current, *mode))?;
+        }
+    }
+    Ok(())
+}
+
+/// Set the permission bits of `path` (following a symlink to a directory).
+pub fn chmod(path: &Path, mode: u32) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("cannot change the permissions of {}", path.display()))
 }
 
 /// Write `data` to `path` atomically (via a temporary file and rename).
@@ -340,7 +390,7 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
         let src_meta = lstat(&src).unwrap().unwrap();
-        copy_entry(&src, &src_meta, &dst, None).unwrap();
+        copy_entry(&src, &src_meta, &dst, None, &Perms::default()).unwrap();
         let dst_meta = lstat(&dst).unwrap().unwrap();
         assert_eq!(fs::read(&dst).unwrap(), b"hello");
         assert_eq!(dst_meta.mode, 0o755);
@@ -362,7 +412,7 @@ mod tests {
         fs::set_permissions(&dst, fs::Permissions::from_mode(0o600)).unwrap();
         let sm = lstat(&src).unwrap().unwrap();
         let dm = lstat(&dst).unwrap().unwrap();
-        copy_entry(&src, &sm, &dst, Some(&dm)).unwrap();
+        copy_entry(&src, &sm, &dst, Some(&dm), &Perms::default()).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), b"new");
         assert_eq!(lstat(&dst).unwrap().unwrap().mode, 0o700);
     }
@@ -373,7 +423,7 @@ mod tests {
         let a = sb.path().join("a");
         fs::write(&a, b"x").unwrap();
         let am = lstat(&a).unwrap().unwrap();
-        let err = copy_entry(&a, &am, &a, Some(&am)).unwrap_err();
+        let err = copy_entry(&a, &am, &a, Some(&am), &Perms::default()).unwrap_err();
         assert!(err.to_string().contains("same file"), "{err}");
         assert_eq!(fs::read(&a).unwrap(), b"x");
 
@@ -384,7 +434,7 @@ mod tests {
         let d = sb.path().join("d");
         fs::create_dir(&d).unwrap();
         let dm = lstat(&d).unwrap().unwrap();
-        assert!(copy_entry(&a, &am, &d, Some(&dm)).is_err());
+        assert!(copy_entry(&a, &am, &d, Some(&dm), &Perms::default()).is_err());
     }
 
     #[test]
@@ -396,12 +446,35 @@ mod tests {
         fs::write(&dst, b"a real file").unwrap();
         let lm = lstat(&link).unwrap().unwrap();
         let dm = lstat(&dst).unwrap().unwrap();
-        copy_entry(&link, &lm, &dst, Some(&dm)).unwrap();
+        copy_entry(&link, &lm, &dst, Some(&dm), &Perms::default()).unwrap();
         assert_eq!(
             fs::read_link(&dst).unwrap(),
             PathBuf::from("target/elsewhere")
         );
         assert_eq!(fs::read_dir(sb.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn restrictions_apply_to_the_file_and_to_directories_created() {
+        let sb = sandbox();
+        let src = sb.path().join("src");
+        fs::write(&src, b"secret").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+        let sm = lstat(&src).unwrap().unwrap();
+        let existing = sb.path().join("home");
+        fs::create_dir(&existing).unwrap();
+        let dst = existing.join(".ssh/keys/config");
+        let perms = Perms {
+            restrict: Some(0o600),
+            dirs: vec![(existing.join(".ssh"), 0o700), (existing.clone(), 0o700)],
+        };
+        copy_entry(&src, &sm, &dst, None, &perms).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().mode() & 0o777;
+        assert_eq!(mode(&dst), 0o600);
+        assert_eq!(mode(&existing.join(".ssh")), 0o700);
+        assert!(existing.join(".ssh/keys").is_dir());
+        // Directories that already existed are not touched.
+        assert_ne!(mode(&existing), 0o700);
     }
 
     #[test]

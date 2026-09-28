@@ -41,7 +41,7 @@ impl Backup {
             return Ok(());
         }
         let dest = rel.under(&self.dir);
-        fsx::copy_entry(path, meta, &dest, None)
+        fsx::copy_entry(path, meta, &dest, None, &fsx::Perms::default())
             .with_context(|| format!("cannot back up {} to {}", path.display(), dest.display()))?;
         self.count += 1;
         Ok(())

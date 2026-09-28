@@ -75,7 +75,13 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     };
 
     let scan = ctx.scanner().scan(&scope)?;
-    let plan = plan::plan(&scan, &ctx.cfg.layout, Direction::Save, force);
+    let plan = plan::plan(
+        &scan,
+        &ctx.cfg.layout,
+        &ctx.manifest.modes,
+        Direction::Save,
+        force,
+    );
     failures += plan.troubled();
 
     for n in &scan.notes {
@@ -109,19 +115,28 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
 
     let copies = plan.count(Op::Create) + plan.count(Op::Overwrite);
     let removals = plan.count(Op::Remove);
-    let bytes = plan.bytes_to_copy();
-    let mut summary = format!(
-        "{} ({})",
-        ui::plural(copies, "file to copy", "files to copy"),
-        fsx::human_size(bytes)
-    );
+    let records = plan.records_set();
+    let mut parts = Vec::new();
+    if copies > 0 || records == 0 {
+        parts.push(format!(
+            "{} ({})",
+            ui::plural(copies, "file to copy", "files to copy"),
+            fsx::human_size(plan.bytes_to_copy())
+        ));
+    }
     if removals > 0 {
-        summary.push_str(&format!(
-            ", {} from the store",
+        parts.push(format!(
+            "{} from the store",
             ui::plural(removals, "file to remove", "files to remove")
         ));
     }
-    ctx.note(&format!("  {summary}"));
+    if records > 0 {
+        parts.push(format!(
+            "permissions of {} to record",
+            ui::plural(records, "path", "paths")
+        ));
+    }
+    ctx.note(&format!("  {}", parts.join(", ")));
 
     if ctx.dry_run {
         ctx.note("dry run, nothing changed");
@@ -129,10 +144,17 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     }
     if !ctx.confirm(&format!(
         "save {}?",
-        ui::plural(plan.actions.len(), "change", "changes")
+        ui::plural(
+            plan.actions.len() + plan.standalone_records().count(),
+            "change",
+            "changes"
+        )
     ))? {
         ctx.note("aborted");
         return Ok(1);
+    }
+    for r in &plan.records {
+        manifest_changed |= ctx.manifest.set_mode(&r.rel, r.to);
     }
     if manifest_changed {
         ctx.manifest.save(&ctx.cfg.layout.store)?;

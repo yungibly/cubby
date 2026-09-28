@@ -7,6 +7,7 @@ mod history;
 mod ignore;
 mod manifest;
 mod paths;
+mod perms;
 mod plan;
 mod scan;
 mod testutil;

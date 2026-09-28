@@ -46,6 +46,7 @@ impl Sandbox {
             .env_remove("CUBBY_PAGER")
             .env("PAGER", "cat")
             .env("NO_COLOR", "1")
+            .envs(GIT_ENV)
             .current_dir(&self.home)
             .output()
             .expect("failed to run cubby")
@@ -114,6 +115,37 @@ impl Sandbox {
     fn history(&self) -> String {
         fs::read_to_string(self.home.join(".local/state/cubby/history.log")).unwrap_or_default()
     }
+}
+
+/// Keep git away from the real configuration, and give it an identity.
+const GIT_ENV: [(&str, &str); 6] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_AUTHOR_NAME", "cubby test"),
+    ("GIT_AUTHOR_EMAIL", "test@example.com"),
+    ("GIT_COMMITTER_NAME", "cubby test"),
+    ("GIT_COMMITTER_EMAIL", "test@example.com"),
+];
+
+/// Run git in `dir` with a predictable umask; panics on failure.
+fn git(dir: &Path, args: &str) -> String {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("umask 022 && git {args}"))
+        .current_dir(dir)
+        .envs(GIT_ENV)
+        .output()
+        .expect("failed to run git");
+    assert!(
+        out.status.success(),
+        "git {args}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 fn write(path: &Path, content: &str) {
@@ -729,6 +761,83 @@ fn executable_bit_propagates_and_permissions_are_kept() {
     sb.ok(&["restore", "~/.secret", "-y"]);
     assert_eq!(sb.read_home(".secret"), "new\n");
     assert_eq!(mode(&sb.home_path(".secret")), 0o600);
+}
+
+#[test]
+fn private_permissions_survive_a_fresh_clone() {
+    let a = Sandbox::ready();
+    a.write_home(".ssh/config", "Host x\n");
+    a.write_home(".netrc", "machine api password hunter2\n");
+    a.write_home(".bin/tool", "#!/bin/sh\n");
+    chmod(&a.home_path(".ssh"), 0o700);
+    chmod(&a.home_path(".ssh/config"), 0o600);
+    chmod(&a.home_path(".netrc"), 0o600);
+    chmod(&a.home_path(".bin/tool"), 0o700);
+    let text = a.ok(&["~/.ssh/config", "~/.netrc", "~/.bin/tool", "-y"]);
+    assert!(text.contains("~ .ssh/ "), "{text}");
+    assert!(text.contains("record permissions 700"), "{text}");
+    let m = a.manifest();
+    for line in [
+        "\"~/.bin/tool\" = \"700\"",
+        "\"~/.netrc\" = \"600\"",
+        "\"~/.ssh\" = \"700\"",
+        "\"~/.ssh/config\" = \"600\"",
+    ] {
+        assert!(m.contains(line), "{line} in\n{m}");
+    }
+    assert!(!m.contains(".bin\""), "{m}");
+    // Private at home, private in the store.
+    assert_eq!(mode(&a.store_path(".netrc")), 0o600);
+    assert_eq!(mode(&a.store_path(".ssh")), 0o700);
+    let text = a.ok(&["list"]);
+    assert!(text.contains(".netrc mode 600"), "{text}");
+    git(&a.store, "init -q && git add -A && git commit -qm dots");
+
+    // Another machine clones the store: git kept only the executable bit.
+    let b = Sandbox::new();
+    git(
+        &b.home,
+        &format!("clone -q {} .dotfiles", a.store.display()),
+    );
+    b.ok(&["init"]);
+    assert_eq!(mode(&b.store_path(".netrc")), 0o644);
+    b.ok(&["restore", "-y"]);
+    assert_eq!(mode(&b.home_path(".netrc")), 0o600);
+    assert_eq!(mode(&b.home_path(".ssh")), 0o700);
+    assert_eq!(mode(&b.home_path(".ssh/config")), 0o600);
+    assert_eq!(mode(&b.home_path(".bin/tool")), 0o700);
+    let text = b.ok(&["status"]);
+    assert!(text.contains("up to date"), "{text}");
+
+    // Loosened at home: status says so, saving keeps the record, and
+    // restore tightens it again.
+    chmod(&b.home_path(".netrc"), 0o644);
+    chmod(&b.home_path(".ssh"), 0o755);
+    let text = b.ok(&["status"]);
+    assert!(
+        text.contains("permissions\n  ~ .netrc") && text.contains("644 at home, 600 recorded"),
+        "{text}"
+    );
+    assert!(text.contains("~ .ssh/"), "{text}");
+    assert_eq!(b.cmd(&["status", "-q"]).status.code(), Some(1));
+    b.ok(&["-y"]);
+    assert!(b.manifest().contains("\"~/.netrc\" = \"600\""));
+    let text = b.ok(&["restore", "-y"]);
+    assert!(text.contains("permissions 644 → 600"), "{text}");
+    assert!(text.contains("permissions 755 → 700"), "{text}");
+    assert_eq!(mode(&b.home_path(".netrc")), 0o600);
+    assert_eq!(mode(&b.home_path(".ssh")), 0o700);
+
+    // Loosening a record on purpose takes --force.
+    chmod(&b.home_path(".netrc"), 0o644);
+    let text = b.ok(&["save", "--force", "~/.netrc", "-y"]);
+    assert!(text.contains("forget recorded permissions 600"), "{text}");
+    assert!(!b.manifest().contains("netrc"));
+
+    // Untracking drops the records that go with it.
+    b.ok(&["untrack", "~/.ssh/config", "-y"]);
+    let m = b.manifest();
+    assert!(!m.contains(".ssh"), "{m}");
 }
 
 #[test]

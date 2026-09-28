@@ -85,6 +85,17 @@ impl Rel {
     pub fn components(&self) -> impl Iterator<Item = &str> {
         self.0.split('/')
     }
+
+    /// The directory this lies in, unless that is home itself.
+    pub fn parent(&self) -> Option<Rel> {
+        self.0.rsplit_once('/').map(|(p, _)| Rel(p.to_owned()))
+    }
+
+    /// Every directory this lies in, innermost first, up to (not including)
+    /// home.
+    pub fn ancestors(&self) -> impl Iterator<Item = Rel> {
+        std::iter::successors(self.parent(), Rel::parent)
+    }
 }
 
 impl fmt::Display for Rel {

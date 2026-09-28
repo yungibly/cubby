@@ -1,13 +1,15 @@
 //! The store manifest: `.cubby.toml` at the root of the store.
 //!
-//! The store's contents say *which files* are tracked. The manifest adds the
-//! two things the contents alone cannot express: which directories are
-//! tracked as a whole (so new files under them are picked up and deleted
-//! files are dropped from the store), and which patterns to ignore.
+//! The store's contents say *which files* are tracked. The manifest adds
+//! what the contents alone cannot express: which directories are tracked as
+//! a whole (so new files under them are picked up and deleted files are
+//! dropped from the store), which patterns to ignore, and the permissions of
+//! private files and directories, which git does not keep.
 //!
 //! It lives in the store so it is versioned and shared with it. cubby edits
 //! it in place, so comments people write in it survive.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -34,13 +36,16 @@ pub struct Manifest {
     pub dirs: Vec<Rel>,
     /// Ignore patterns; see [`crate::ignore`] for the syntax.
     pub ignore: Vec<String>,
+    /// Permissions of files and directories that group and others cannot
+    /// read; see [`crate::perms`].
+    pub modes: BTreeMap<Rel, u32>,
     /// The file as written, edited in place so comments survive.
     doc: DocumentMut,
 }
 
 impl PartialEq for Manifest {
     fn eq(&self, other: &Manifest) -> bool {
-        self.dirs == other.dirs && self.ignore == other.ignore
+        self.dirs == other.dirs && self.ignore == other.ignore && self.modes == other.modes
     }
 }
 
@@ -54,6 +59,27 @@ struct Raw {
     dirs: Vec<String>,
     #[serde(default)]
     ignore: Vec<String>,
+    #[serde(default)]
+    modes: BTreeMap<String, RawMode>,
+}
+
+/// A mode as written: `"600"`, or a number such as `0o600`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawMode {
+    Text(String),
+    Number(i64),
+}
+
+impl RawMode {
+    fn bits(&self) -> Option<u32> {
+        let bits = match self {
+            RawMode::Text(t) if (3..=4).contains(&t.len()) => u32::from_str_radix(t, 8).ok()?,
+            RawMode::Number(n) => u32::try_from(*n).ok()?,
+            RawMode::Text(_) => return None,
+        };
+        (bits <= 0o7777).then_some(bits & 0o777)
+    }
 }
 
 /// What happened when a directory was added.
@@ -88,6 +114,9 @@ impl Manifest {
              # ignore: never tracked. A pattern without a slash matches a file or\n\
              #       directory name at any depth; one with a slash matches a path\n\
              #       relative to your home directory (`**` is allowed).\n\
+             # modes: permissions git cannot keep. cubby records the files and\n\
+             #       directories that group and others cannot read when you save,\n\
+             #       and restore applies them.\n\
              #\n\
              # cubby keeps your comments when it updates this file.\n\n",
         );
@@ -139,9 +168,18 @@ impl Manifest {
             }
         }
         dirs.sort();
+        let mut modes = BTreeMap::new();
+        for (path, mode) in raw.modes {
+            let rel = Rel::parse(&path).with_context(|| format!("modes entry {path:?}"))?;
+            let bits = mode.bits().with_context(|| {
+                format!("modes entry {path:?}: a mode is three octal digits, like \"600\"")
+            })?;
+            modes.insert(rel, bits);
+        }
         Ok(Manifest {
             dirs,
             ignore: raw.ignore,
+            modes,
             doc,
         })
     }
@@ -197,6 +235,45 @@ impl Manifest {
             .unwrap_or(array.len());
         tomlx::insert_str(array, index, &rel.to_string());
         AddDir::Added { absorbed }
+    }
+
+    /// Record the permissions of `rel`, or forget them with `None`. Returns
+    /// whether anything changed.
+    pub fn set_mode(&mut self, rel: &Rel, mode: Option<u32>) -> bool {
+        if self.modes.get(rel).copied() == mode {
+            return false;
+        }
+        let key = rel.to_string();
+        let table = self
+            .doc
+            .as_table_mut()
+            .entry("modes")
+            .or_insert_with(toml_edit::table)
+            .as_table_mut()
+            .expect("modes is a table");
+        match mode {
+            Some(m) => {
+                self.modes.insert(rel.clone(), m);
+                let is_new = !table.contains_key(&key);
+                table.insert(&key, toml_edit::value(format!("{m:03o}")));
+                if is_new {
+                    table.sort_values();
+                }
+            }
+            None => {
+                self.modes.remove(rel);
+                // Hand-written entries may spell the path differently.
+                let keys: Vec<String> = table
+                    .iter()
+                    .map(|(k, _)| k.to_owned())
+                    .filter(|k| Rel::parse(k).ok().as_ref() == Some(rel))
+                    .collect();
+                for k in keys {
+                    table.remove(&k);
+                }
+            }
+        }
+        true
     }
 
     pub fn remove_dir(&mut self, rel: &Rel) -> bool {
@@ -286,6 +363,35 @@ mod tests {
         assert!(m.ignore.is_empty());
         assert!(Manifest::parse("dirs = ['../x']").is_err());
         assert!(Manifest::parse("dir = []").is_err());
+    }
+
+    #[test]
+    fn modes_round_trip_and_keep_their_comments() {
+        let mut m = Manifest::parse(
+            "dirs = []\n\n# private things\n[modes]\n# the netrc has a password\n\"~/.netrc\" = \"600\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.modes.get(&rel(".netrc")), Some(&0o600));
+        assert!(m.set_mode(&rel(".ssh"), Some(0o700)));
+        assert!(!m.set_mode(&rel(".ssh"), Some(0o700)));
+        assert!(m.set_mode(&rel(".gnupg"), Some(0o700)));
+        let out = m.render();
+        assert!(
+            out.contains(
+                "# private things\n[modes]\n\"~/.gnupg\" = \"700\"\n# the netrc has a password\n\"~/.netrc\" = \"600\"\n\"~/.ssh\" = \"700\"\n"
+            ),
+            "{out}"
+        );
+        let parsed = Manifest::parse(&out).unwrap();
+        assert_eq!(parsed, m);
+        assert!(m.set_mode(&rel(".netrc"), None));
+        assert!(!m.render().contains("netrc"));
+
+        let m = Manifest::parse("[modes]\n'/.a' = 0o640\n\".b\" = \"0700\"\n").unwrap();
+        assert_eq!(m.modes.get(&rel(".a")), Some(&0o640));
+        assert_eq!(m.modes.get(&rel(".b")), Some(&0o700));
+        assert!(Manifest::parse("[modes]\n\".a\" = \"rw\"\n").is_err());
+        assert!(Manifest::parse("[modes]\n\".a\" = \"99999\"\n").is_err());
     }
 
     #[test]

@@ -2,6 +2,8 @@ use anyhow::Result;
 
 use super::Ctx;
 use crate::fsx::Kind;
+use crate::paths::Rel;
+use crate::perms;
 use crate::ui::{self, Tree};
 
 pub fn run(ctx: &Ctx, plain: bool) -> Result<i32> {
@@ -15,22 +17,41 @@ pub fn run(ctx: &Ctx, plain: bool) -> Result<i32> {
         return Ok(0);
     }
 
+    let mode = |rel: &Rel| {
+        ctx.manifest
+            .modes
+            .get(rel)
+            .map(|m| format!("mode {}", perms::show(*m)))
+    };
     let mut tree = Tree::default();
+    // Recorded directory modes first, so tracked directories can add to them.
+    for rel in ctx.manifest.modes.keys() {
+        if entries.iter().any(|(e, _)| e.is_within(rel) && e != rel) {
+            tree.insert(rel.as_str(), mode(rel), false);
+        }
+    }
     for dir in &ctx.manifest.dirs {
-        tree.insert(dir.as_str(), Some("(tracked directory)".into()), false);
+        let note = match mode(dir) {
+            Some(m) => format!("(tracked directory, {m})"),
+            None => "(tracked directory)".to_owned(),
+        };
+        tree.insert(dir.as_str(), Some(note), false);
     }
     let mut symlinks = 0;
     for (rel, meta) in &entries {
-        let note = (meta.kind == Kind::Symlink).then(|| {
+        let mut notes = Vec::new();
+        if meta.kind == Kind::Symlink {
             symlinks += 1;
-            format!(
+            notes.push(format!(
                 "-> {}",
                 meta.target
                     .as_ref()
                     .map(|t| t.display().to_string())
                     .unwrap_or_default()
-            )
-        });
+            ));
+        }
+        notes.extend(mode(rel));
+        let note = (!notes.is_empty()).then(|| notes.join(", "));
         tree.insert(rel.as_str(), note, true);
     }
 

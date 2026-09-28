@@ -20,6 +20,7 @@ use crate::history::History;
 use crate::ignore::Ignore;
 use crate::manifest::Manifest;
 use crate::paths::Rel;
+use crate::perms;
 use crate::plan::{self, Op, Plan, Skip};
 use crate::scan::{Scan, Scanner, Scope};
 use crate::ui::{self, ColorChoice, Style};
@@ -344,10 +345,38 @@ impl Ctx {
             }
             let symbol = match a.op {
                 Op::Create => self.style.green("+"),
-                Op::Overwrite => self.style.yellow("~"),
+                Op::Overwrite | Op::Chmod => self.style.yellow("~"),
                 Op::Remove => self.style.red("-"),
             };
-            println!("{}", ui::row(&self.style, &symbol, a.rel.as_str(), &a.note));
+            let path = if a.op == Op::Chmod && a.dst.is_dir() {
+                format!("{}/", a.rel.as_str())
+            } else {
+                a.rel.as_str().to_owned()
+            };
+            println!("{}", ui::row(&self.style, &symbol, &path, &a.note));
+        }
+        for r in plan.standalone_records() {
+            let path = if r.is_dir {
+                format!("{}/", r.rel.as_str())
+            } else {
+                r.rel.as_str().to_owned()
+            };
+            let note = match (r.from, r.to) {
+                (None, Some(to)) => format!("record permissions {}", perms::show(to)),
+                (Some(from), Some(to)) => format!(
+                    "record permissions {} (was {})",
+                    perms::show(to),
+                    perms::show(from)
+                ),
+                (Some(from), None) => {
+                    format!("forget recorded permissions {}", perms::show(from))
+                }
+                (None, None) => continue,
+            };
+            println!(
+                "{}",
+                ui::row(&self.style, &self.style.yellow("~"), &path, &note)
+            );
         }
     }
 
@@ -436,7 +465,9 @@ impl Ctx {
             },
         )?;
 
-        let mut summary = plan.kind.summary(outcome.done);
+        let mut summary = plan
+            .kind
+            .summary(outcome.done + plan.standalone_records().count());
         if !outcome.failed.is_empty() {
             summary.push_str(&format!(", {} failed", outcome.failed.len()));
         }

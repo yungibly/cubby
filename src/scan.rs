@@ -6,9 +6,10 @@
 //! at home" a meaningful state: cubby only looks for new files where you
 //! told it to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use walkdir::WalkDir;
@@ -59,6 +60,33 @@ pub struct Entry {
     pub dir: Option<Rel>,
 }
 
+/// A tracked file or directory whose permissions at home differ from what
+/// the manifest records (see [`crate::perms`]).
+#[derive(Clone, Debug)]
+pub struct PermDiff {
+    pub rel: Rel,
+    pub is_dir: bool,
+    /// The home path, for changing its permissions.
+    pub path: PathBuf,
+    /// The permission bits at home.
+    pub home: u32,
+    pub recorded: Option<u32>,
+    /// What a save would record.
+    pub record: Option<u32>,
+    /// What a restore would leave at home.
+    pub restored: u32,
+}
+
+impl PermDiff {
+    pub fn needs_record(&self) -> bool {
+        self.record != self.recorded
+    }
+
+    pub fn needs_chmod(&self) -> bool {
+        self.restored != self.home
+    }
+}
+
 /// Something that was skipped, and why.
 #[derive(Clone, Debug)]
 pub struct Note {
@@ -78,6 +106,11 @@ pub struct Scan {
     /// more likely an unmounted volume or a wiped config than a deliberate
     /// deletion of every file.
     pub empty_dirs: Vec<Rel>,
+    /// Permission differences, files and directories, sorted by path.
+    pub perms: Vec<PermDiff>,
+    /// The permission bits of every home directory that holds a tracked
+    /// path, for creating their counterparts in the store.
+    pub dir_modes: BTreeMap<Rel, u32>,
     pub notes: Vec<Note>,
 }
 
@@ -204,12 +237,71 @@ impl Scanner<'_> {
             });
         }
 
+        let (perms, dir_modes) = self.perm_diffs(&entries);
         Ok(Scan {
             entries,
             absent_dirs,
             empty_dirs,
+            perms,
+            dir_modes,
             notes,
         })
+    }
+
+    /// Compare the permissions of tracked files that are on both sides, and
+    /// of the home directories holding tracked paths, with the manifest's
+    /// records.
+    fn perm_diffs(&self, entries: &[Entry]) -> (Vec<PermDiff>, BTreeMap<Rel, u32>) {
+        let recorded = |rel: &Rel| self.manifest.modes.get(rel).copied();
+        let diff = |rel: &Rel, is_dir: bool, path: PathBuf, mode: u32| {
+            let rec = recorded(rel);
+            let d = PermDiff {
+                rel: rel.clone(),
+                is_dir,
+                path,
+                home: mode & 0o777,
+                recorded: rec,
+                record: crate::perms::after_save(mode, rec, false),
+                restored: crate::perms::after_restore(mode, rec),
+            };
+            (d.needs_record() || d.needs_chmod()).then_some(d)
+        };
+        let mut perms = Vec::new();
+        // Directories holding tracked paths, and holding anything at all
+        // (a file named on the command line is about to be tracked).
+        let mut tracked_dirs = BTreeSet::new();
+        let mut all_dirs = BTreeSet::new();
+        for e in entries {
+            let Some(h) = &e.home else { continue };
+            // Tracked: in the store, or new under a tracked directory.
+            let tracked = e.store.is_some() || e.dir.is_some();
+            if tracked && h.kind == Kind::File && e.store.is_some() {
+                perms.extend(diff(&e.rel, false, h.path.clone(), h.mode));
+            }
+            for d in e.rel.ancestors() {
+                if tracked {
+                    tracked_dirs.insert(d.clone());
+                }
+                if !all_dirs.insert(d) {
+                    break;
+                }
+            }
+        }
+        let mut dir_modes = BTreeMap::new();
+        for d in all_dirs {
+            let path = self.layout.live(&d);
+            // Follow a symlinked directory: its target's permissions count.
+            if let Ok(md) = std::fs::metadata(&path)
+                && md.is_dir()
+            {
+                dir_modes.insert(d.clone(), md.mode() & 0o777);
+                if tracked_dirs.contains(&d) {
+                    perms.extend(diff(&d, true, path, md.mode()));
+                }
+            }
+        }
+        perms.sort_by(|a, b| a.rel.cmp(&b.rel));
+        (perms, dir_modes)
     }
 
     /// Every file and symlink in the store, ignoring nothing but ignored
