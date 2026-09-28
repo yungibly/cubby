@@ -933,6 +933,18 @@ fn non_utf8_names_are_skipped_not_fatal() {
 }
 
 #[test]
+fn unusual_directory_names_keep_the_manifest_readable() {
+    let sb = Sandbox::ready();
+    let name = ".config/notes-\u{1F469}\u{200D}\u{1F4BB} \"quoted\"";
+    sb.write_home(&format!("{name}/a.md"), "hi\n");
+    sb.ok(&[&format!("~/{name}"), "-y"]);
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("1 tracked file up to date"), "{text}");
+    let text = sb.ok(&["list"]);
+    assert!(text.contains("(tracked directory)"), "{text}");
+}
+
+#[test]
 fn status_quiet_uses_exit_codes() {
     let sb = Sandbox::new();
     let out = sb.cmd(&["status", "-q"]);

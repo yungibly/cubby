@@ -22,13 +22,13 @@ pub struct Rel(String);
 
 impl Rel {
     /// Build a `Rel` from text such as `.zshrc`, `~/.config/nvim`, or
-    /// `/.config/nvim`. Rejects anything that escapes home.
+    /// `/.config/nvim`. Rejects anything that escapes home. Whitespace is
+    /// kept: it can be part of a name.
     pub fn parse(text: &str) -> Result<Rel> {
-        let trimmed = text.trim();
-        let stripped = trimmed
+        let stripped = text
             .strip_prefix("~/")
-            .or_else(|| trimmed.strip_prefix('/'))
-            .unwrap_or(trimmed);
+            .or_else(|| text.strip_prefix('/'))
+            .unwrap_or(text);
         let stripped = nfc(stripped);
         let mut parts: Vec<&str> = Vec::new();
         for part in stripped.split('/') {
@@ -38,7 +38,7 @@ impl Rel {
                 p => parts.push(p),
             }
         }
-        if parts.is_empty() || trimmed == "~" {
+        if parts.is_empty() || text == "~" {
             bail!("the home directory itself cannot be tracked");
         }
         Ok(Rel(parts.join("/")))

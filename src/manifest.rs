@@ -12,6 +12,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::config::toml_string;
 use crate::fsx;
 use crate::paths::Rel;
 
@@ -107,11 +108,11 @@ impl Manifest {
         );
         out.push_str("dirs = [\n");
         for d in &self.dirs {
-            out.push_str(&format!("  {:?},\n", d.to_string()));
+            out.push_str(&format!("  {},\n", toml_string(&d.to_string())));
         }
         out.push_str("]\n\nignore = [\n");
         for p in &self.ignore {
-            out.push_str(&format!("  {p:?},\n"));
+            out.push_str(&format!("  {},\n", toml_string(p)));
         }
         out.push_str("]\n");
         out
@@ -167,6 +168,29 @@ mod tests {
         let parsed = Manifest::parse(&m.render()).unwrap();
         assert_eq!(parsed, m);
         assert_eq!(parsed.dirs, vec![rel(".config/fish"), rel(".config/nvim")]);
+    }
+
+    #[test]
+    fn round_trip_keeps_any_name() {
+        let names = [
+            "notes-\u{1F469}\u{200D}\u{1F4BB}",
+            "\u{301}starts-with-a-mark",
+            "zero\u{200B}width",
+            "tab\there",
+            "esc\u{1b}x",
+            "del\u{7f}x",
+            "new\nline",
+            "quote\"and\\backslash",
+            "it's",
+            " padded ",
+        ];
+        let mut m = Manifest::fresh();
+        for n in names {
+            m.add_dir(rel(&format!(".config/{n}")));
+            m.ignore.push(n.to_owned());
+        }
+        let parsed = Manifest::parse(&m.render()).unwrap();
+        assert_eq!(parsed, m);
     }
 
     #[test]

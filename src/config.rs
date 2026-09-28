@@ -154,14 +154,21 @@ impl Config {
              #\n\
              # store: the directory that mirrors your home directory. Every tracked\n\
              #        file lives at the same path inside it. Version it with git.\n\
-             store = {store:?}\n\
+             store = {store}\n\
              \n\
              # backups: keep copies of files cubby overwrites or removes, under\n\
              #          ~/.local/state/cubby/backups (the newest {keep} runs are kept).\n\
              backups = true\n",
+            store = toml_string(store),
             keep = BACKUP_SETS_TO_KEEP
         )
     }
+}
+
+/// `s` as a TOML string, escaped by TOML's rules (Rust's `{:?}` escapes are
+/// not valid TOML).
+pub fn toml_string(s: &str) -> String {
+    toml::Value::String(s.to_owned()).to_string()
 }
 
 fn read_config_file(path: &Path) -> Result<ConfigFile> {
@@ -184,6 +191,18 @@ mod tests {
         let file: ConfigFile = toml::from_str(&text).unwrap();
         assert_eq!(file.store.as_deref(), Some("~/.dotfiles"));
         assert_eq!(file.backups, Some(true));
+    }
+
+    #[test]
+    fn template_parses_with_any_store_name() {
+        for store in [
+            "~/dots-\u{1F469}\u{200D}\u{1F4BB}",
+            "~/tab\tand \"quotes\" and \\",
+            "~/esc\u{1b}",
+        ] {
+            let file: ConfigFile = toml::from_str(&Config::template(store)).unwrap();
+            assert_eq!(file.store.as_deref(), Some(store));
+        }
     }
 
     #[test]
