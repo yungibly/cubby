@@ -102,18 +102,23 @@ impl Sandbox {
         self.read_store(".cubby.toml")
     }
 
+    /// The backup directories of recorded runs, oldest first.
     fn backups(&self) -> Vec<PathBuf> {
-        let dir = self.home.join(".local/state/cubby/backups");
+        let dir = self.home.join(".local/state/cubby/runs");
         let mut sets: Vec<PathBuf> = match fs::read_dir(dir) {
-            Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+            Ok(rd) => rd
+                .map(|e| e.unwrap().path().join("backup"))
+                .filter(|b| b.exists())
+                .collect(),
             Err(_) => Vec::new(),
         };
         sets.sort();
         sets
     }
 
+    /// Every run, with the files each touched.
     fn history(&self) -> String {
-        fs::read_to_string(self.home.join(".local/state/cubby/history.log")).unwrap_or_default()
+        self.ok(&["history", "-v", "--all"])
     }
 }
 
@@ -205,7 +210,7 @@ fn save_a_file_then_nothing_to_do() {
     let text = sb.ok(&["-y"]);
     assert!(text.contains("~ .zshrc"), "{text}");
     assert_eq!(sb.read_store(".zshrc"), "export EDITOR=vim\n");
-    assert!(sb.history().contains("\tsave\t.zshrc"));
+    assert!(sb.history().contains("~ .zshrc overwrite in the store"));
 }
 
 #[test]
@@ -255,20 +260,14 @@ fn tracked_directory_picks_up_new_files_and_mirrors_deletions() {
     assert_eq!(sb.read_store(".config/nvim/init.lua"), "-- init v2\n");
     assert!(
         sb.history()
-            .contains("\tremove\t.config/nvim/lua/keymaps.lua")
+            .contains("- .config/nvim/lua/keymaps.lua remove in the store")
     );
 
     // The removed file was backed up.
     let sets = sb.backups();
     assert_eq!(sets.len(), 1, "{sets:?}");
-    assert!(
-        sets[0]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .ends_with("-save")
-    );
+    let run = sets[0].parent().unwrap().file_name().unwrap();
+    assert!(run.to_str().unwrap().contains("-save"), "{run:?}");
     assert!(sets[0].join(".config/nvim/lua/keymaps.lua").exists());
     assert!(
         sets[0].join(".config/nvim/init.lua").exists(),
@@ -335,7 +334,7 @@ fn restore_creates_and_overwrites_with_backups() {
         fs::read_to_string(sets[0].join(".zshrc")).unwrap(),
         "local edits\n"
     );
-    assert!(sb.history().contains("\trestore\t.zshrc"));
+    assert!(sb.history().contains("~ .zshrc overwrite at home"));
 
     let text = sb.ok(&["restore", "-y"]);
     assert!(text.contains("nothing to restore"), "{text}");
@@ -462,7 +461,11 @@ fn untrack_files_and_directories() {
     let sets = sb.backups();
     assert_eq!(sets.len(), 2);
     assert!(sets[1].join(".config/nvim/lua/x.lua").exists());
-    assert!(sb.history().contains("\tuntrack\t.zshrc"));
+    let history = sb.history();
+    assert!(
+        history.contains("untrack") && history.contains("- .zshrc remove in the store"),
+        "{history}"
+    );
 }
 
 #[test]
@@ -695,7 +698,7 @@ fn dry_run_changes_nothing_and_prompts_need_a_tty() {
     let text = sb.ok(&["~/.zshrc", "-n"]);
     assert!(text.contains("dry run"), "{text}");
     assert!(!sb.store_path(".zshrc").exists());
-    assert!(sb.history().is_empty());
+    assert!(sb.history().contains("no history yet"));
 
     // Without --yes and without a terminal, cubby refuses to guess.
     let text = sb.fail(&["~/.zshrc"]);
@@ -1161,13 +1164,120 @@ fn history_lists_operations() {
     sb.write_store(".zshrc", "changed\n");
     sb.ok(&["restore", "-y"]);
     let text = sb.ok(&["history"]);
-    assert!(text.contains("save      .zshrc"), "{text}");
-    assert!(text.contains("restore   .zshrc"), "{text}");
-    assert!(text.contains("2 entries shown"), "{text}");
+    assert!(text.contains("save      1 change"), "{text}");
+    assert!(text.contains("restore   1 change · 1 backed up"), "{text}");
+    assert!(text.contains("2 runs shown"), "{text}");
     let text = sb.ok(&["history", "--op", "restore"]);
     assert!(!text.contains("save "), "{text}");
     let text = sb.ok(&["history", "-c", "1"]);
-    assert!(text.contains("1 entry shown of 2"), "{text}");
+    assert!(text.contains("1 run shown of 2"), "{text}");
+    let text = sb.ok(&["history", "-v"]);
+    assert!(text.contains("~ .zshrc overwrite at home"), "{text}");
+    let text = sb.fail(&["history", "--op", "sav"]);
+    assert!(text.contains("possible values"), "{text}");
+
+    // cubby 2's log is pointed to, not lost.
+    fs::write(
+        sb.home.join(".local/state/cubby/history.log"),
+        "2026-01-01T00:00:00Z\tsave\t.zshrc\n",
+    )
+    .unwrap();
+    let text = sb.ok(&["history"]);
+    assert!(text.contains("earlier history, from cubby 2"), "{text}");
+}
+
+#[test]
+fn undo_reverses_the_last_run() {
+    let sb = Sandbox::ready();
+    sb.write_home(".zshrc", "mine\n");
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.ok(&["~/.zshrc", "~/.config/app", "-y"]);
+
+    // A forced restore overwrites a local edit and creates a file...
+    sb.write_home(".zshrc", "local edit\n");
+    sb.write_store(".zshrc", "from elsewhere\n");
+    sb.write_store(".config/app/new.conf", "n\n");
+    let text = sb.ok(&["restore", "--force", "-y"]);
+    assert!(text.contains("`cubby undo` reverses this"), "{text}");
+    assert_eq!(sb.read_home(".zshrc"), "from elsewhere\n");
+
+    // ...and undo puts the edit back and takes the new file away.
+    let text = sb.ok(&["undo", "-y"]);
+    assert!(text.contains("put back at home"), "{text}");
+    assert!(text.contains("created at home by that run"), "{text}");
+    assert_eq!(sb.read_home(".zshrc"), "local edit\n");
+    assert!(!sb.home_path(".config/app/new.conf").exists());
+    assert!(
+        sb.home_path(".config/app").exists(),
+        "home directories stay"
+    );
+    // The last sync is as it was, so the state is as it was.
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("changed at home and in the store"), "{text}");
+    assert!(text.contains("new in the store"), "{text}");
+
+    // Undoing a save that tracked a directory untracks it again.
+    sb.write_home(".config/fish/config.fish", "set x\n");
+    sb.ok(&["~/.config/fish", "-y"]);
+    assert!(sb.manifest().contains("fish"));
+    sb.ok(&["undo", "-y"]);
+    assert!(!sb.manifest().contains("fish"), "{}", sb.manifest());
+    assert!(!sb.store_path(".config/fish").exists());
+
+    // What changed again since is left alone.
+    sb.write_home(".vimrc", "v1\n");
+    sb.ok(&["~/.vimrc", "-y"]);
+    sb.write_store(".vimrc", "v2\n");
+    let text = sb.fail(&["undo", "-y"]);
+    assert!(text.contains("changed since"), "{text}");
+    assert_eq!(sb.read_store(".vimrc"), "v2\n");
+
+    let text = sb.ok(&["history"]);
+    assert!(text.contains("undone"), "{text}");
+    assert!(text.contains("reverses"), "{text}");
+    let text = sb.fail(&["undo", "nope"]);
+    assert!(text.contains("no run nope"), "{text}");
+}
+
+#[test]
+fn backups_are_listed_and_found_by_path() {
+    let sb = Sandbox::ready();
+    let text = sb.ok(&["backups"]);
+    assert!(text.contains("no backups yet"), "{text}");
+    sb.write_home(".zshrc", "one\n");
+    sb.ok(&["~/.zshrc", "-y"]);
+    sb.write_home(".zshrc", "two\n");
+    sb.ok(&["-y"]);
+    sb.write_home(".zshrc", "three\n");
+    sb.ok(&["-y"]);
+    // cubby 2 kept its copies elsewhere; they are found too.
+    sb.write_home(
+        ".local/state/cubby/backups/20200101-000000-restore/.zshrc",
+        "ancient\n",
+    );
+
+    let text = sb.ok(&["backups"]);
+    assert_eq!(
+        text.lines().filter(|l| l.contains("  save  ")).count(),
+        2,
+        "{text}"
+    );
+    assert!(text.contains("1 file, 4 B"), "{text}");
+    assert!(text.contains("20200101-000000-restore"), "{text}");
+    let text = sb.ok(&["backups", "~/.zshrc"]);
+    assert!(
+        text.contains("3 copies of ~/.zshrc, newest first"),
+        "{text}"
+    );
+    let newest = text
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap();
+    let newest = sb.home.join(newest.strip_prefix("~/").unwrap());
+    assert_eq!(fs::read_to_string(newest).unwrap(), "two\n");
 }
 
 #[test]

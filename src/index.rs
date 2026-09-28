@@ -38,11 +38,11 @@ const RACY_NS: i64 = 2_000_000_000;
 pub struct Fp([u8; 16]);
 
 impl Fp {
-    fn hex(&self) -> String {
+    pub fn hex(&self) -> String {
         hex(&self.0)
     }
 
-    fn parse(text: &str) -> Option<Fp> {
+    pub fn parse(text: &str) -> Option<Fp> {
         let bytes = unhex(text)?;
         Some(Fp(bytes.try_into().ok()?))
     }
@@ -63,6 +63,23 @@ pub enum Base {
 impl Base {
     pub fn exists(self) -> bool {
         self != Base::None
+    }
+
+    /// `-`, `?`, or the fingerprint, as the index and run records write it.
+    pub fn to_text(self) -> String {
+        match self {
+            Base::None => "-".to_owned(),
+            Base::Seen => "?".to_owned(),
+            Base::Is(fp) => fp.hex(),
+        }
+    }
+
+    pub fn from_text(text: &str) -> Option<Base> {
+        match text {
+            "-" => Some(Base::None),
+            "?" => Some(Base::Seen),
+            hex => Fp::parse(hex).map(Base::Is),
+        }
     }
 }
 
@@ -205,6 +222,23 @@ impl Index {
         }
     }
 
+    /// Put back a baseline, as it was before a run that is being undone.
+    pub fn set_base(&mut self, rel: &Rel, base: Base) {
+        if base == Base::None {
+            self.forget(rel);
+            return;
+        }
+        let record = Record {
+            base,
+            home: None,
+            store: None,
+        };
+        if self.records.get(rel) != Some(&record) {
+            self.records.insert(rel.clone(), record);
+            self.changed = true;
+        }
+    }
+
     /// Nothing to remember about `rel` any more.
     pub fn forget(&mut self, rel: &Rel) {
         self.changed |= self.records.remove(rel).is_some();
@@ -265,11 +299,7 @@ impl Index {
         }
         let mut out = format!("{HEADER}\t{}\n", escape(&self.store.to_string_lossy()));
         for (rel, r) in &self.records {
-            let base = match r.base {
-                Base::None => "-".to_owned(),
-                Base::Seen => "?".to_owned(),
-                Base::Is(fp) => fp.hex(),
-            };
+            let base = r.base.to_text();
             out.push_str(&format!(
                 "{}\t{base}\t{}\t{}\n",
                 escape(rel.as_str()),
@@ -377,11 +407,7 @@ fn parse_cached(text: &str) -> Option<Option<Cached>> {
 fn parse_line(line: &str) -> Option<(Rel, Record)> {
     let mut fields = line.split('\t');
     let rel = Rel::parse(&unescape(fields.next()?)?).ok()?;
-    let base = match fields.next()? {
-        "-" => Base::None,
-        "?" => Base::Seen,
-        hex => Base::Is(Fp::parse(hex)?),
-    };
+    let base = Base::from_text(fields.next()?)?;
     let home = parse_cached(fields.next()?)?;
     let store = parse_cached(fields.next()?)?;
     Some((rel, Record { base, home, store }))

@@ -72,31 +72,35 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         return Ok(1);
     }
 
-    let code = ctx.run_plan(&plan)?;
-    // Directories left empty in the store go too.
-    for rel in &scope_rels {
-        fsx::prune_empty_dirs(Some(&ctx.cfg.layout.stored(rel)), &ctx.cfg.layout.store);
-    }
-    let mut manifest_changed = false;
+    // The manifest changes with the files, as part of the same run: the
+    // directories untracked, and permission records for what leaves the
+    // store (untracked files, and directories that will hold nothing).
     for d in &dirs_to_drop {
-        manifest_changed |= ctx.manifest.remove_dir(d);
+        ctx.manifest.remove_dir(d);
     }
-    // Permission records for what left the store go with it: records of
-    // untracked files, and of directories that no longer hold anything.
-    let remaining = ctx.shared_scanner().store_entries()?;
+    let removed: Vec<&Rel> = plan.actions.iter().map(|a| &a.rel).collect();
+    let remaining: Vec<Rel> = ctx
+        .shared_scanner()
+        .store_entries()?
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .filter(|rel| !removed.contains(&rel))
+        .collect();
     let stale: Vec<Rel> = ctx
         .manifest
         .modes
         .keys()
         .filter(|r| scope_rels.iter().any(|s| r.is_within(s) || s.is_within(r)))
-        .filter(|r| !remaining.iter().any(|(rel, _)| rel.is_within(r)))
+        .filter(|r| !remaining.iter().any(|rel| rel.is_within(r)))
         .cloned()
         .collect();
     for r in stale {
-        manifest_changed |= ctx.manifest.set_mode(&r, None);
+        ctx.manifest.set_mode(&r, None);
     }
-    if manifest_changed {
-        ctx.manifest.save(&ctx.cfg.layout.store)?;
+    let code = ctx.run_plan(&plan)?;
+    // Directories left empty in the store go too.
+    for rel in &scope_rels {
+        fsx::prune_empty_dirs(Some(&ctx.cfg.layout.stored(rel)), &ctx.cfg.layout.store);
     }
     Ok(if failures > 0 { 1 } else { code })
 }

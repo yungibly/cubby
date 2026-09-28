@@ -82,8 +82,8 @@ fn everywhere(ctx: &mut Ctx, patterns: &[String], remove: bool) -> Result<i32> {
         ctx.note("dry run, nothing changed");
         return Ok(0);
     }
-    ctx.manifest.save(&ctx.cfg.layout.store)?;
     if remove {
+        ctx.manifest.save(&ctx.cfg.layout.store)?;
         return Ok(0);
     }
 
@@ -96,6 +96,7 @@ fn everywhere(ctx: &mut Ctx, patterns: &[String], remove: bool) -> Result<i32> {
         .map(|(rel, meta)| (rel, meta.path))
         .collect();
     if matched.is_empty() {
+        ctx.manifest.save(&ctx.cfg.layout.store)?;
         return Ok(0);
     }
     let plan = plan::removal_plan(matched);
@@ -113,11 +114,14 @@ fn everywhere(ctx: &mut Ctx, patterns: &[String], remove: bool) -> Result<i32> {
             "them"
         }
     ))? {
+        ctx.manifest.save(&ctx.cfg.layout.store)?;
         ctx.note(
             "left in the store; cubby no longer sees them, so delete them with git if you want them gone",
         );
         return Ok(0);
     }
+    // The run writes the new pattern along with the removals, so undoing
+    // it puts both back.
     ctx.run_plan(&plan)
 }
 

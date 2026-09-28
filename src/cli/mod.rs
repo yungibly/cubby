@@ -1,5 +1,6 @@
 //! Command-line interface.
 
+mod backups;
 mod diff;
 mod history;
 mod ignore;
@@ -9,6 +10,7 @@ mod restore;
 mod save;
 mod status;
 mod sync;
+mod undo;
 mod untrack;
 
 use std::path::PathBuf;
@@ -16,9 +18,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
-use crate::backup::{self, Backup};
-use crate::config::{self, Config, Overrides};
-use crate::history::History;
+use crate::config::{Config, Overrides};
 use crate::ignore::Ignore;
 use crate::index::Index;
 use crate::lock::Lock;
@@ -26,6 +26,7 @@ use crate::manifest::Manifest;
 use crate::paths::Rel;
 use crate::perms;
 use crate::plan::{self, Op, Plan, RunKind, Side, Skip};
+use crate::runs::{self, Run};
 use crate::scan::{Scan, Scanner, Scope};
 use crate::ui::{self, ColorChoice, Style};
 
@@ -175,17 +176,29 @@ enum Command {
         #[arg(long)]
         remove: bool,
     },
-    /// Show what cubby has done
+    /// Show what cubby has done, one line per run
     History {
-        /// How many entries to show
+        /// How many runs to show
         #[arg(short = 'c', long, default_value_t = 20, value_name = "N")]
         count: usize,
-        /// Show all entries
+        /// Show every run
         #[arg(short, long)]
         all: bool,
-        /// Only show this kind of operation
-        #[arg(long, value_name = "OP")]
+        /// Only show runs of this kind
+        #[arg(long, value_name = "KIND", value_parser = ["save", "restore", "sync", "untrack", "undo"])]
         op: Option<String>,
+    },
+    /// Reverse the last run, or the run with this id (see `cubby history`)
+    ///
+    /// Paths that changed again since that run are left alone.
+    Undo {
+        #[arg(value_name = "RUN")]
+        id: Option<String>,
+    },
+    /// List the backups of overwritten and removed files, or one path's
+    Backups {
+        #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
+        path: Option<String>,
     },
     /// Create the config file and the store
     Init {
@@ -254,7 +267,7 @@ impl Ctx {
         };
         let mut index = Index::load(&cfg.state_dir, &cfg.layout.store);
         if !index.existed() {
-            index.import_legacy(History::new(&cfg.state_dir).synced_paths());
+            index.import_legacy(runs::legacy_synced(&cfg.state_dir));
         }
         Ok(Ctx {
             cfg,
@@ -327,10 +340,6 @@ impl Ctx {
             index: &self.index,
             own,
         }
-    }
-
-    pub fn history(&self) -> History {
-        History::new(&self.cfg.state_dir)
     }
 
     pub fn store_label(&self) -> String {
@@ -587,20 +596,30 @@ impl Ctx {
         }
     }
 
-    /// Carry out a plan: back up, apply, report. Returns the exit code.
+    /// Carry out a plan as one run: record it, keep copies of what it
+    /// overwrites or removes, apply it, and report. Manifest edits made
+    /// while planning are written and recorded as part of the run, so
+    /// `cubby undo` reverses them too. Returns the exit code.
     pub fn run_plan(&mut self, plan: &Plan) -> Result<i32> {
-        let backup = self
-            .cfg
-            .backups
-            .then(|| Backup::new(&self.cfg.state_dir, plan.kind.verb()));
-        let history = self.history();
+        let mut run = Run::start(
+            &self.cfg.state_dir,
+            plan.kind.verb(),
+            &self.cfg.layout.store,
+            self.cfg.backups,
+        );
+        if let Some(id) = &plan.undoes {
+            run.set_undoes(id);
+        }
+        if !self.manifest.edits().is_empty() {
+            run.record_manifest(self.manifest.edits());
+            self.manifest.save(&self.cfg.layout.store)?;
+        }
         let style = self.style;
         // The plan was already printed; only failures need a line of their own.
         let outcome = plan::apply(
             plan,
             &self.cfg.layout,
-            backup,
-            &history,
+            &mut run,
             &mut self.index,
             |action, result| {
                 if let Err(msg) = result {
@@ -610,10 +629,13 @@ impl Ctx {
                     );
                 }
             },
-        )?;
+        );
         if let Err(e) = self.index.save() {
             self.warn(&format!("could not update the index: {e:#}"));
         }
+        let backed_up = run.backed_up();
+        let id = run.id().to_owned();
+        let recorded = run.finish();
 
         let mut summary = plan
             .kind
@@ -621,22 +643,29 @@ impl Ctx {
         if !outcome.failed.is_empty() {
             summary.push_str(&format!(", {} failed", outcome.failed.len()));
         }
-        if let Some(dir) = &outcome.backup_dir {
+        if backed_up > 0 {
             summary.push_str(&format!(
-                " · {} backed up to {}",
-                ui::plural(outcome.backed_up, "file", "files"),
-                self.cfg.layout.pretty(dir)
+                " · {} backed up",
+                ui::plural(backed_up, "file", "files")
             ));
         }
-        println!("{}", self.style.dim(&summary));
-        if let Some(e) = &outcome.history_error {
-            self.warn(&format!("could not record this run in the history: {e}"));
+        if recorded.is_ok() && outcome.done > 0 {
+            // A plain `cubby undo` steps back past undos, so reversing one
+            // takes its id.
+            if plan.kind == RunKind::Undo {
+                summary.push_str(&format!(" · `cubby undo {id}` reverses this"));
+            } else {
+                summary.push_str(" · `cubby undo` reverses this");
+            }
         }
-
-        if self.cfg.backups
-            && let Err(e) = backup::prune(&self.cfg.state_dir, config::BACKUP_SETS_TO_KEEP)
-        {
-            self.warn(&format!("could not prune old backups: {e:#}"));
+        println!("{}", self.style.dim(&summary));
+        if let Err(e) = recorded {
+            self.warn(&format!(
+                "could not record this run, so it cannot be undone: {e:#}"
+            ));
+        }
+        if let Err(e) = runs::prune(&self.cfg.state_dir, self.cfg.backup_days) {
+            self.warn(&format!("could not remove old backups: {e:#}"));
         }
         Ok(if outcome.failed.is_empty() { 0 } else { 1 })
     }
@@ -753,6 +782,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Some(Command::History { count, all, op }) => {
             let ctx = Ctx::load(&global)?;
             history::run(&ctx, count, all, op.as_deref())
+        }
+        Some(Command::Undo { id }) => {
+            let mut ctx = Ctx::load(&global)?;
+            undo::run(&mut ctx, id.as_deref())
+        }
+        Some(Command::Backups { path }) => {
+            let ctx = Ctx::load(&global)?;
+            backups::run(&ctx, path.as_deref())
         }
         Some(Command::Init { dir, force }) => init::run(&global, dir.as_deref(), force),
         Some(Command::Completion { shell }) => {

@@ -292,9 +292,9 @@ fn replace_with_symlink(target: &Path, dst: &Path) -> Result<()> {
     bail!("cannot find a free temporary name in {}", dir.display())
 }
 
-/// Remove a file or symlink (never a directory), then remove any parent
-/// directories left empty, stopping at `stop`.
-pub fn remove_entry(path: &Path, stop: &Path) -> Result<()> {
+/// Remove a file or symlink (never a directory). With `prune_to`, parent
+/// directories left empty are removed too, up to (not including) it.
+pub fn remove_entry(path: &Path, prune_to: Option<&Path>) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(md) if md.is_dir() => bail!("{} is a directory", path.display()),
         Ok(_) => {
@@ -303,7 +303,9 @@ pub fn remove_entry(path: &Path, stop: &Path) -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot remove {}", path.display())),
     }
-    prune_empty_dirs(path.parent(), stop);
+    if let Some(stop) = prune_to {
+        prune_empty_dirs(path.parent(), stop);
+    }
     Ok(())
 }
 
@@ -466,10 +468,10 @@ mod tests {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, b"x").unwrap();
         fs::write(root.join("a/keep"), b"x").unwrap();
-        remove_entry(&file, &root).unwrap();
+        remove_entry(&file, Some(&root)).unwrap();
         assert!(!root.join("a/b").exists());
         assert!(root.join("a/keep").exists());
-        remove_entry(&root.join("a/keep"), &root).unwrap();
+        remove_entry(&root.join("a/keep"), Some(&root)).unwrap();
         assert!(!root.join("a").exists());
         assert!(root.exists());
         assert!(lstat(&root.join("nope/x")).unwrap().is_none());

@@ -41,6 +41,23 @@ pub struct Manifest {
     pub modes: BTreeMap<Rel, u32>,
     /// The file as written, edited in place so comments survive.
     doc: DocumentMut,
+    /// Every edit since loading, in order, so a run can record them and
+    /// `cubby undo` can reverse exactly those.
+    edits: Vec<Edit>,
+}
+
+/// One change to the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edit {
+    AddDir(Rel),
+    RemoveDir(Rel),
+    AddIgnore(String),
+    RemoveIgnore(String),
+    Mode {
+        rel: Rel,
+        from: Option<u32>,
+        to: Option<u32>,
+    },
 }
 
 impl PartialEq for Manifest {
@@ -181,13 +198,37 @@ impl Manifest {
             ignore: raw.ignore,
             modes,
             doc,
+            edits: Vec::new(),
         })
     }
 
-    pub fn save(&self, store: &Path) -> Result<()> {
+    pub fn save(&mut self, store: &Path) -> Result<()> {
         let path = Self::path(store);
         fsx::write_atomic(&path, self.render().as_bytes())
-            .with_context(|| format!("cannot write {}", path.display()))
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        self.edits.clear();
+        Ok(())
+    }
+
+    /// Edits made since loading or last saving.
+    pub fn edits(&self) -> &[Edit] {
+        &self.edits
+    }
+
+    /// Reverse `edit`, as far as the manifest still reflects it. Returns
+    /// whether anything changed.
+    pub fn reverse(&mut self, edit: &Edit) -> bool {
+        match edit {
+            Edit::AddDir(rel) => self.remove_dir(rel),
+            Edit::RemoveDir(rel) => {
+                matches!(self.add_dir(rel.clone()), AddDir::Added { .. })
+            }
+            Edit::AddIgnore(p) => self.remove_ignore(p),
+            Edit::RemoveIgnore(p) => self.add_ignore(p),
+            Edit::Mode { rel, from, to } => {
+                self.modes.get(rel).copied() == *to && self.set_mode(rel, *from)
+            }
+        }
     }
 
     /// The file's text, marked with the format version it now uses.
@@ -221,6 +262,9 @@ impl Manifest {
         self.dirs.retain(|d| !d.is_within(&rel));
         self.dirs.push(rel.clone());
         self.dirs.sort();
+        self.edits
+            .extend(absorbed.iter().cloned().map(Edit::RemoveDir));
+        self.edits.push(Edit::AddDir(rel.clone()));
 
         let array = tomlx::array_mut(&mut self.doc, "dirs").expect("dirs is a list");
         tomlx::remove_where(array, |v| parses_within(v, &rel));
@@ -240,9 +284,15 @@ impl Manifest {
     /// Record the permissions of `rel`, or forget them with `None`. Returns
     /// whether anything changed.
     pub fn set_mode(&mut self, rel: &Rel, mode: Option<u32>) -> bool {
-        if self.modes.get(rel).copied() == mode {
+        let from = self.modes.get(rel).copied();
+        if from == mode {
             return false;
         }
+        self.edits.push(Edit::Mode {
+            rel: rel.clone(),
+            from,
+            to: mode,
+        });
         let key = rel.to_string();
         let table = self
             .doc
@@ -283,6 +333,7 @@ impl Manifest {
             return false;
         }
         self.ignore.push(pattern.to_owned());
+        self.edits.push(Edit::AddIgnore(pattern.to_owned()));
         let array = tomlx::array_mut(&mut self.doc, "ignore").expect("ignore is a list");
         let end = array.len();
         tomlx::insert_str(array, end, pattern);
@@ -296,6 +347,7 @@ impl Manifest {
         if before == self.ignore.len() {
             return false;
         }
+        self.edits.push(Edit::RemoveIgnore(pattern.to_owned()));
         let array = tomlx::array_mut(&mut self.doc, "ignore").expect("ignore is a list");
         tomlx::remove_where(array, |v| v.as_str() == Some(pattern));
         true
@@ -307,6 +359,7 @@ impl Manifest {
         if before == self.dirs.len() {
             return false;
         }
+        self.edits.push(Edit::RemoveDir(rel.clone()));
         let array = tomlx::array_mut(&mut self.doc, "dirs").expect("dirs is a list");
         tomlx::remove_where(array, |v| {
             v.as_str().and_then(|s| Rel::parse(s).ok()).as_ref() == Some(rel)
@@ -423,6 +476,39 @@ mod tests {
         assert_eq!(m.modes.get(&rel(".b")), Some(&0o700));
         assert!(Manifest::parse("[modes]\n\".a\" = \"rw\"\n").is_err());
         assert!(Manifest::parse("[modes]\n\".a\" = \"99999\"\n").is_err());
+    }
+
+    #[test]
+    fn edits_are_logged_and_can_be_reversed() {
+        let mut m = Manifest::parse("dirs = ['~/.config/nvim']\n").unwrap();
+        m.add_dir(rel(".config"));
+        m.add_ignore("*.bak");
+        m.set_mode(&rel(".netrc"), Some(0o600));
+        assert_eq!(
+            m.edits(),
+            &[
+                Edit::RemoveDir(rel(".config/nvim")),
+                Edit::AddDir(rel(".config")),
+                Edit::AddIgnore("*.bak".into()),
+                Edit::Mode {
+                    rel: rel(".netrc"),
+                    from: None,
+                    to: Some(0o600)
+                },
+            ]
+        );
+        for e in m.edits().to_vec().iter().rev() {
+            assert!(m.reverse(e), "{e:?}");
+        }
+        assert_eq!(m, Manifest::parse("dirs = ['~/.config/nvim']\n").unwrap());
+        // A record changed since is left alone.
+        m.set_mode(&rel(".netrc"), Some(0o640));
+        let stale = Edit::Mode {
+            rel: rel(".netrc"),
+            from: None,
+            to: Some(0o600),
+        };
+        assert!(!m.reverse(&stale));
     }
 
     #[test]

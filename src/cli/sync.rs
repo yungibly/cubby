@@ -75,12 +75,9 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         ctx.note("aborted");
         return Ok(1);
     }
-    let mut manifest_changed = false;
+    // The run writes the manifest, and records these edits for undo.
     for r in &plan.records {
-        manifest_changed |= ctx.manifest.set_mode(&r.rel, r.to);
-    }
-    if manifest_changed {
-        ctx.manifest.save(&ctx.cfg.layout.store)?;
+        ctx.manifest.set_mode(&r.rel, r.to);
     }
     let code = ctx.run_plan(&plan)?;
     Ok(if failures > 0 { 1 } else { code })

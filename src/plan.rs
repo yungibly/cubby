@@ -12,13 +12,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::backup::Backup;
 use crate::fsx::{self, Kind, Perms};
-use crate::history::History;
 use crate::index::{self, Index};
 pub use crate::paths::Side;
 use crate::paths::{Layout, Rel};
 use crate::perms;
+use crate::runs::{Recorded, Run};
 use crate::scan::{Change, Entry, Scan, State};
 
 /// Which way a save or restore copies.
@@ -47,6 +46,7 @@ pub enum RunKind {
     Restore,
     Sync,
     Untrack,
+    Undo,
 }
 
 impl RunKind {
@@ -56,6 +56,7 @@ impl RunKind {
             RunKind::Restore => "restore",
             RunKind::Sync => "sync",
             RunKind::Untrack => "untrack",
+            RunKind::Undo => "undo",
         }
     }
 
@@ -66,6 +67,7 @@ impl RunKind {
             RunKind::Restore => "restored",
             RunKind::Sync => "synced",
             RunKind::Untrack => "removed",
+            RunKind::Undo => "undid",
         }
     }
 
@@ -160,6 +162,8 @@ pub struct Plan {
     pub skipped: Vec<Skipped>,
     /// Permission records to write to the manifest.
     pub records: Vec<ModeRecord>,
+    /// For an undo: the run it reverses.
+    pub undoes: Option<String>,
 }
 
 impl Plan {
@@ -169,6 +173,7 @@ impl Plan {
             actions: Vec::new(),
             skipped: Vec::new(),
             records: Vec::new(),
+            undoes: None,
         }
     }
 
@@ -591,51 +596,59 @@ pub fn removal_plan(files: impl IntoIterator<Item = (Rel, PathBuf)>) -> Plan {
 pub struct Outcome {
     pub done: usize,
     pub failed: Vec<(Action, String)>,
-    pub backup_dir: Option<PathBuf>,
-    pub backed_up: usize,
-    /// Why the history could not be written, if it could not. That is
-    /// worth a warning but not worth stopping halfway through a run.
-    pub history_error: Option<String>,
 }
 
-/// Carry out a plan, keeping the index's baselines up to date. `report` is
-/// called after each action with the result.
+/// Carry out a plan, recording each action in `run` (with a copy of
+/// whatever it overwrites or removes) and keeping the index's baselines up
+/// to date. `report` is called after each action with the result.
 pub fn apply(
     plan: &Plan,
     layout: &Layout,
-    mut backup: Option<Backup>,
-    history: &History,
+    run: &mut Run,
     index: &mut Index,
     mut report: impl FnMut(&Action, Result<(), &str>),
-) -> Result<Outcome> {
+) -> Outcome {
     let mut done = 0;
     let mut failed = Vec::new();
-    let mut history_error = None;
     for action in &plan.actions {
-        let result = perform(action, layout, backup.as_mut());
-        match result {
-            Ok(()) => {
+        let base = index.base(&action.rel);
+        match perform(action, layout, run) {
+            Ok(performed) => {
                 done += 1;
+                let mut fp = None;
                 match action.op {
                     // Both sides now hold what was copied.
                     Op::Create | Op::Overwrite => {
-                        match fsx::lstat(&action.dst)
-                            .ok()
-                            .flatten()
-                            .map(|m| index::fingerprint(&m))
-                        {
-                            Some(Ok(fp)) => index.synced(&action.rel, fp),
+                        let now = fsx::lstat(&action.dst).ok().flatten();
+                        match now.map(|m| index::fingerprint(&m)) {
+                            Some(Ok(f)) => {
+                                index.synced(&action.rel, f);
+                                fp = Some(f.hex());
+                            }
                             _ => index.forget(&action.rel),
                         }
                     }
                     Op::Remove => index.forget(&action.rel),
                     Op::Chmod => {}
                 }
-                if let Err(e) = history.record(op_name(action, plan.kind), &action.rel)
-                    && history_error.is_none()
-                {
-                    history_error = Some(format!("{e:#}"));
-                }
+                run.record(Recorded {
+                    path: action.rel.as_str().to_owned(),
+                    side: match action.side {
+                        Side::Home => "home".into(),
+                        Side::Store => "store".into(),
+                    },
+                    op: match action.op {
+                        Op::Create => "create".into(),
+                        Op::Overwrite => "overwrite".into(),
+                        Op::Remove => "remove".into(),
+                        Op::Chmod => "chmod".into(),
+                    },
+                    backup: performed.backed_up,
+                    fp,
+                    base: Some(base.to_text()),
+                    mode_before: performed.mode_before.map(perms::show),
+                    mode_after: action.mode.map(perms::show),
+                });
                 report(action, Ok(()));
             }
             Err(e) => {
@@ -645,48 +658,41 @@ pub fn apply(
             }
         }
     }
-    let (backup_dir, backed_up) = match backup {
-        Some(b) if b.count() > 0 => (Some(b.dir().to_path_buf()), b.count()),
-        _ => (None, 0),
-    };
-    Ok(Outcome {
-        done,
-        failed,
-        backup_dir,
-        backed_up,
-        history_error,
-    })
+    Outcome { done, failed }
 }
 
-fn op_name(action: &Action, kind: RunKind) -> &'static str {
-    match (action.op, action.side, kind) {
-        (Op::Remove, _, RunKind::Untrack) => "untrack",
-        (Op::Remove, _, _) => "remove",
-        (Op::Chmod, _, _) => "chmod",
-        (_, Side::Store, _) => "save",
-        (_, Side::Home, _) => "restore",
-    }
+/// What carrying out an action involved, for its record.
+struct Performed {
+    backed_up: bool,
+    mode_before: Option<u32>,
 }
 
-fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Result<()> {
+fn perform(action: &Action, layout: &Layout, run: &mut Run) -> Result<Performed> {
     let rel = &action.rel;
-    // Removed directories are pruned up to the root of the side written.
-    let root = match action.side {
-        Side::Home => &layout.home,
-        Side::Store => &layout.store,
+    let mut done = Performed {
+        backed_up: false,
+        mode_before: None,
     };
     match action.op {
         Op::Remove => {
-            if let Some(meta) = fsx::lstat(&action.dst)?
-                && let Some(b) = backup
-            {
-                b.stash(rel, &action.dst, &meta)?;
+            if let Some(meta) = fsx::lstat(&action.dst)? {
+                done.backed_up = run.stash(rel, &action.dst, &meta)?;
             }
-            fsx::remove_entry(&action.dst, root)
+            // Directories left empty are pruned in the store, which cubby
+            // owns, but never at home.
+            let prune_to = match action.side {
+                Side::Store => Some(layout.store.as_path()),
+                Side::Home => None,
+            };
+            fsx::remove_entry(&action.dst, prune_to)?;
         }
         Op::Chmod => {
             let mode = action.mode.ok_or_else(|| anyhow!("no mode for {rel}"))?;
-            fsx::chmod(&action.dst, mode)
+            let meta = std::fs::metadata(&action.dst)
+                .with_context(|| format!("cannot read {}", action.dst.display()))?;
+            done.mode_before =
+                Some(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o7777);
+            fsx::chmod(&action.dst, mode)?;
         }
         Op::Create | Op::Overwrite => {
             let src = action
@@ -696,10 +702,9 @@ fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Res
             // Look again rather than trusting the scan: things change.
             let src_meta = fsx::lstat(src)?.ok_or_else(|| anyhow!("{} vanished", src.display()))?;
             let dst_meta = fsx::lstat(&action.dst)?;
-            if let Some(d) = &dst_meta
-                && let Some(b) = backup
-            {
-                b.stash(rel, &action.dst, d)
+            if let Some(d) = &dst_meta {
+                done.backed_up = run
+                    .stash(rel, &action.dst, d)
                     .with_context(|| format!("cannot back up {}", action.dst.display()))?;
             }
             fsx::copy_entry(
@@ -708,7 +713,8 @@ fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Res
                 &action.dst,
                 dst_meta.as_ref(),
                 &action.perms,
-            )
+            )?;
         }
     }
+    Ok(done)
 }

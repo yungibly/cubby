@@ -16,14 +16,13 @@ use serde::Deserialize;
 use crate::paths::{Layout, expand_tilde, expand_tilde_path, normalize};
 
 pub const DEFAULT_STORE: &str = "~/.dotfiles";
-/// How many backup sets to keep before pruning the oldest.
-pub const BACKUP_SETS_TO_KEEP: usize = 20;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     store: Option<String>,
     backups: Option<bool>,
+    backup_days: Option<u32>,
     skip: Option<Vec<String>>,
 }
 
@@ -40,6 +39,8 @@ pub struct Config {
     pub layout: Layout,
     /// Keep copies of overwritten or removed files under the state directory.
     pub backups: bool,
+    /// How many days to keep runs and their copies.
+    pub backup_days: u32,
     /// The config file that was read, or would be created by `cubby init`.
     pub config_path: PathBuf,
     /// Where history and backups live.
@@ -151,6 +152,7 @@ impl Config {
                 store,
             },
             backups: !overrides.no_backup && file.backups.unwrap_or(true),
+            backup_days: file.backup_days.unwrap_or(crate::runs::DEFAULT_DAYS),
             config_path,
             state_dir: env.state_dir,
             store_is_default,
@@ -183,8 +185,11 @@ impl Config {
              store = {store}\n\
              \n\
              # backups: keep copies of files cubby overwrites or removes, under\n\
-             #          ~/.local/state/cubby/backups (the newest {keep} runs are kept).\n\
+             #          ~/.local/state/cubby/runs, so `cubby undo` can put them back.\n\
+             # backup_days: how long to keep them. The newest {keep} runs of each kind\n\
+             #          (save, restore, ...) are kept however old they are.\n\
              backups = true\n\
+             backup_days = {days}\n\
              \n\
              # skip: paths or patterns this machine leaves alone even though they\n\
              #       are in the store; say, macOS-only settings on a Linux machine.\n\
@@ -192,7 +197,8 @@ impl Config {
              #       `cubby ignore --here PATTERN` adds to it.\n\
              skip = []\n",
             store = toml_string(store),
-            keep = BACKUP_SETS_TO_KEEP
+            keep = crate::runs::KEEP_PER_KIND,
+            days = crate::runs::DEFAULT_DAYS,
         )
     }
 }
@@ -246,6 +252,7 @@ mod tests {
         let file: ConfigFile = toml::from_str(&text).unwrap();
         assert_eq!(file.store.as_deref(), Some("~/.dotfiles"));
         assert_eq!(file.backups, Some(true));
+        assert_eq!(file.backup_days, Some(30));
         assert_eq!(file.skip, Some(vec![]));
     }
 
