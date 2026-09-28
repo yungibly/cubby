@@ -102,7 +102,11 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 impl Config {
     pub fn load(overrides: &Overrides) -> Result<Config> {
         let env = Env::detect()?;
-        let config_path = overrides.config.clone().unwrap_or(env.config_path.clone());
+        let config_path = match &overrides.config {
+            Some(p) if p.is_absolute() => normalize(p),
+            Some(p) => normalize(&std::env::current_dir()?.join(p)),
+            None => env.config_path.clone(),
+        };
         let file = read_config_file(&config_path)?;
 
         let (store, store_is_default) = if let Some(s) = &overrides.store {
@@ -145,6 +149,21 @@ impl Config {
             state_dir: env.state_dir,
             store_is_default,
         })
+    }
+
+    /// cubby's own files, which belong to this machine and are never
+    /// tracked: the config file and the state directory.
+    pub fn own_paths(&self) -> Vec<(PathBuf, &'static str)> {
+        vec![
+            (
+                self.config_path.clone(),
+                "cubby's own configuration stays on this machine",
+            ),
+            (
+                self.state_dir.clone(),
+                "cubby's own state (history and backups) stays on this machine",
+            ),
+        ]
     }
 
     /// Text of a fresh config file.

@@ -119,6 +119,10 @@ pub struct Scanner<'a> {
     pub layout: &'a Layout,
     pub manifest: &'a Manifest,
     pub ignore: &'a Ignore,
+    /// Device and inode of the store, cubby's state directory, and its
+    /// config file: never walked into or copied, even through a symlinked
+    /// path that the ignore rules would not recognise.
+    pub own: Vec<(u64, u64)>,
 }
 
 impl Scanner<'_> {
@@ -130,7 +134,6 @@ impl Scanner<'_> {
         let mut absent_dirs = Vec::new();
         let mut empty_dirs = Vec::new();
         let mut present_dirs = Vec::new();
-        let store_meta = fsx::lstat(&self.layout.store)?;
 
         for dir in &self.manifest.dirs {
             if !scope.may_descend(dir) {
@@ -141,8 +144,7 @@ impl Scanner<'_> {
                 absent_dirs.push(dir.clone());
                 continue;
             }
-            let seen =
-                self.walk_home_dir(dir, scope, store_meta.as_ref(), &mut home_side, &mut notes)?;
+            let seen = self.walk_home_dir(dir, scope, &mut home_side, &mut notes)?;
             if seen == 0 && store_side.keys().any(|r| r.is_within(dir)) {
                 empty_dirs.push(dir.clone());
             } else {
@@ -281,7 +283,6 @@ impl Scanner<'_> {
         &self,
         dir: &Rel,
         scope: &Scope,
-        store_meta: Option<&Meta>,
         found: &mut BTreeMap<Rel, Meta>,
         notes: &mut Vec<Note>,
     ) -> Result<usize> {
@@ -323,13 +324,14 @@ impl Scanner<'_> {
             let Some(meta) = fsx::lstat(entry.path())? else {
                 continue;
             };
+            let is_own = self.own.contains(&(meta.dev, meta.ino));
             match meta.kind {
                 Kind::Dir => {
-                    let is_store = store_meta.is_some_and(|s| fsx::same_inode(s, &meta));
-                    if is_store || !scope.may_descend(&rel) {
+                    if is_own || !scope.may_descend(&rel) {
                         walker.skip_current_dir();
                     }
                 }
+                Kind::File if is_own => {}
                 Kind::File | Kind::Symlink => {
                     seen += 1;
                     if scope.includes(&rel) {

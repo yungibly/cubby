@@ -195,7 +195,12 @@ impl Ctx {
             no_backup: global.no_backup,
         })?;
         let manifest = Manifest::load(&cfg.layout.store)?;
-        let ignore = Ignore::new(&manifest.ignore)?;
+        let mut ignore = Ignore::new(&manifest.ignore)?;
+        for (path, why) in cfg.own_paths() {
+            if let Ok(rel) = Rel::from_path_under(&cfg.layout.home, &path) {
+                ignore.reserve(rel, why);
+            }
+        }
         Ok(Ctx {
             cfg,
             manifest,
@@ -208,10 +213,18 @@ impl Ctx {
     }
 
     pub fn scanner(&self) -> Scanner<'_> {
+        // The store, cubby's state, and its config are never walked into or
+        // copied, whatever path leads to them.
+        let own = std::iter::once(self.cfg.layout.store.clone())
+            .chain(self.cfg.own_paths().into_iter().map(|(p, _)| p))
+            .filter_map(|p| crate::fsx::lstat(&p).ok().flatten())
+            .map(|m| (m.dev, m.ino))
+            .collect();
         Scanner {
             layout: &self.cfg.layout,
             manifest: &self.manifest,
             ignore: &self.ignore,
+            own,
         }
     }
 

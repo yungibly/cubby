@@ -18,11 +18,8 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     let mut manifest_changed = false;
     let mut scope_rels = Vec::new();
     for rel in rels {
-        if let Some(pattern) = ctx.ignore.reason(&rel) {
-            ctx.error(&format!(
-                "{rel} is ignored (pattern {pattern:?} in {})",
-                crate::manifest::FILE_NAME
-            ));
+        if let Some(reason) = ctx.ignore.reason(&rel) {
+            ctx.error(&format!("{rel} is ignored: {reason}"));
             failures += 1;
             continue;
         }

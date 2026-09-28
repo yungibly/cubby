@@ -10,7 +10,8 @@
 //! A matched directory excludes everything beneath it. A few patterns are
 //! built in because they are never dotfiles: `.git` directories, `.DS_Store`,
 //! cubby's own temporary files, and at the root of the store the manifest,
-//! `README*`, and `LICENSE*`.
+//! `README*`, and `LICENSE*`. cubby's own configuration file and state
+//! directory are reserved as well, so they stay on the machine they belong to.
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
@@ -26,20 +27,24 @@ pub struct Ignore {
     names: GlobSet,
     paths: GlobSet,
     root: GlobSet,
-    name_patterns: Vec<String>,
-    path_patterns: Vec<String>,
+    /// Why each name pattern ignores something, by index into `names`.
+    name_reasons: Vec<String>,
+    path_reasons: Vec<String>,
+    /// Exact paths (and everything beneath them) that are never tracked.
+    reserved: Vec<(Rel, String)>,
 }
 
 impl Ignore {
+    /// Build from the manifest's patterns.
     pub fn new(patterns: &[String]) -> Result<Ignore> {
         let mut names = GlobSetBuilder::new();
         let mut paths = GlobSetBuilder::new();
-        let mut name_patterns = Vec::new();
-        let mut path_patterns = Vec::new();
+        let mut name_reasons = Vec::new();
+        let mut path_reasons = Vec::new();
 
         for p in BUILTIN_NAMES {
-            names.add(name_glob(p)?);
-            name_patterns.push((*p).to_owned());
+            names.add(glob(p)?);
+            name_reasons.push(format!("{p} is never tracked"));
         }
         for raw in patterns {
             let p = raw.trim();
@@ -51,25 +56,36 @@ impl Ignore {
                 .or_else(|| p.strip_prefix('/'))
                 .unwrap_or(p);
             let stripped = stripped.strip_suffix('/').unwrap_or(stripped);
+            let reason = format!(
+                "pattern {} in {}",
+                crate::config::toml_string(raw),
+                crate::manifest::FILE_NAME
+            );
             if stripped.contains('/') {
-                paths.add(path_glob(stripped)?);
-                path_patterns.push(raw.clone());
+                paths.add(glob(stripped)?);
+                path_reasons.push(reason);
             } else {
-                names.add(name_glob(stripped)?);
-                name_patterns.push(raw.clone());
+                names.add(glob(stripped)?);
+                name_reasons.push(reason);
             }
         }
         let mut root = GlobSetBuilder::new();
         for p in BUILTIN_ROOT {
-            root.add(name_glob(p)?);
+            root.add(glob(p)?);
         }
         Ok(Ignore {
             names: names.build()?,
             paths: paths.build()?,
             root: root.build()?,
-            name_patterns,
-            path_patterns,
+            name_reasons,
+            path_reasons,
+            reserved: Vec::new(),
         })
+    }
+
+    /// Never track `rel` or anything beneath it.
+    pub fn reserve(&mut self, rel: Rel, why: &str) {
+        self.reserved.push((rel, why.to_owned()));
     }
 
     /// Whether `rel` (a file or directory) is ignored. Every ancestor is
@@ -78,36 +94,32 @@ impl Ignore {
         self.reason(rel).is_some()
     }
 
-    /// The pattern responsible for ignoring `rel`, if any.
+    /// Why `rel` is ignored, if it is.
     pub fn reason(&self, rel: &Rel) -> Option<String> {
+        if let Some((_, why)) = self.reserved.iter().find(|(r, _)| rel.is_within(r)) {
+            return Some(why.clone());
+        }
         let mut prefix = String::new();
         for (i, name) in rel.components().enumerate() {
             if i == 0 && self.root.is_match(name) {
                 return Some(format!("{name} at the root of the store is reserved"));
             }
             if let Some(idx) = self.names.matches(name).first() {
-                return Some(self.name_patterns[*idx].clone());
+                return Some(self.name_reasons[*idx].clone());
             }
             if !prefix.is_empty() {
                 prefix.push('/');
             }
             prefix.push_str(name);
             if let Some(idx) = self.paths.matches(&prefix).first() {
-                return Some(self.path_patterns[*idx].clone());
+                return Some(self.path_reasons[*idx].clone());
             }
         }
         None
     }
 }
 
-fn name_glob(pattern: &str) -> Result<Glob> {
-    GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .build()
-        .with_context(|| format!("invalid ignore pattern {pattern:?}"))
-}
-
-fn path_glob(pattern: &str) -> Result<Glob> {
+fn glob(pattern: &str) -> Result<Glob> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
@@ -139,6 +151,10 @@ mod tests {
         assert!(!ig.is_ignored(&rel(".gitconfig")));
         assert!(!ig.is_ignored(&rel(".gitignore")));
         assert!(ig.is_ignored(&rel(".config/.cubby-tmp-abc")));
+        assert_eq!(
+            ig.reason(&rel(".config/nvim/.git/HEAD")).as_deref(),
+            Some(".git is never tracked")
+        );
     }
 
     #[test]
@@ -150,7 +166,7 @@ mod tests {
         assert!(!ig.is_ignored(&rel(".config/nvim/init.lua")));
         assert_eq!(
             ig.reason(&rel(".config/nvim/lazy-lock.json")).as_deref(),
-            Some("lazy-lock.json")
+            Some("pattern \"lazy-lock.json\" in .cubby.toml")
         );
     }
 
@@ -168,6 +184,20 @@ mod tests {
         assert!(ig.is_ignored(&rel(".ssh/id_ed25519")));
         assert!(!ig.is_ignored(&rel(".ssh/config")));
         assert!(!ig.is_ignored(&rel(".config/nvim")));
+    }
+
+    #[test]
+    fn reserved_paths_cover_their_contents() {
+        let mut ig = ignore(&[]);
+        ig.reserve(rel(".local/state/cubby"), "cubby's state stays here");
+        assert!(ig.is_ignored(&rel(".local/state/cubby")));
+        assert!(ig.is_ignored(&rel(".local/state/cubby/history.log")));
+        assert!(!ig.is_ignored(&rel(".local/state/cubbyx")));
+        assert!(!ig.is_ignored(&rel(".local/state")));
+        assert_eq!(
+            ig.reason(&rel(".local/state/cubby/x")).as_deref(),
+            Some("cubby's state stays here")
+        );
     }
 
     #[test]

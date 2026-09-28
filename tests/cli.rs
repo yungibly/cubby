@@ -641,7 +641,7 @@ fn ignore_patterns_are_honoured() {
 
     let text = sb.fail(&["~/.config/nvim/lazy-lock.json", "-y"]);
     assert!(
-        text.contains("is ignored (pattern \"lazy-lock.json\""),
+        text.contains("is ignored: pattern \"lazy-lock.json\" in .cubby.toml"),
         "{text}"
     );
 
@@ -930,6 +930,29 @@ fn non_utf8_names_are_skipped_not_fatal() {
     .unwrap();
     let text = sb.ok(&["list", "--plain"]);
     assert_eq!(text, ".config/app/ok.conf\n");
+}
+
+#[test]
+fn cubbys_own_config_and_state_are_never_tracked() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/nvim/init.lua", "a\n");
+    sb.write_home(".local/bin/tool", "#!/bin/sh\n");
+    let text = sb.ok(&["~/.config", "~/.local", "-y"]);
+    assert!(!text.contains("cubby/"), "{text}");
+    assert!(!sb.store_path(".config/cubby").exists());
+
+    // Saving writes history and backups under ~/.local/state/cubby; none of
+    // that may feed the next run.
+    sb.write_home(".config/nvim/init.lua", "b\n");
+    sb.ok(&["-y"]);
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("nothing to save"), "{text}");
+    assert!(!sb.store_path(".local/state").exists());
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("up to date"), "{text}");
+
+    let text = sb.fail(&["~/.config/cubby/config.toml", "-y"]);
+    assert!(text.contains("stays on this machine"), "{text}");
 }
 
 #[test]
