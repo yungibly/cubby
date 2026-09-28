@@ -503,8 +503,9 @@ fn conflicts_are_skipped_unless_forced() {
     fs::remove_file(sb.home_path(".zshrc")).unwrap();
     std::os::unix::fs::symlink("elsewhere", sb.home_path(".zshrc")).unwrap();
 
-    let text = sb.ok(&["-y"]);
-    assert!(text.contains("nothing to save"), "{text}");
+    // A skipped conflict means the run did not do everything: exit 1.
+    let text = sb.fail(&["-y"]);
+    assert!(text.contains("nothing saved; 1 path skipped"), "{text}");
     assert!(text.contains("! .zshrc"), "{text}");
     assert!(
         text.contains("home has a symlink, store has a file; use --force"),
@@ -601,6 +602,28 @@ fn diff_shows_unified_output_in_both_directions() {
     sb.ok(&["-y"]);
     let text = sb.ok(&["diff", "~/.zshrc"]);
     assert!(text.contains("no differences"), "{text}");
+
+    // Each direction shows only what that command would change.
+    sb.write_store(".only-in-store", "from the store\n");
+    let text = sb.ok(&["diff"]);
+    assert!(!text.contains("from the store"), "{text}");
+    assert!(
+        text.contains("1 file only in the store not shown: saving leaves it alone"),
+        "{text}"
+    );
+    let text = sb.ok(&["diff", "-R"]);
+    assert!(text.contains("+from the store"), "{text}");
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.ok(&["~/.config/app", "-y"]);
+    sb.write_home(".config/app/b.conf", "only at home\n");
+    let text = sb.ok(&["diff", "-R", "~/.config/app"]);
+    assert!(!text.contains("only at home\n"), "{text}");
+    assert!(
+        text.contains("1 file only at home not shown: restore never deletes"),
+        "{text}"
+    );
+    let text = sb.ok(&["diff", "~/.config/app"]);
+    assert!(text.contains("+only at home"), "{text}");
 }
 
 #[test]
@@ -932,8 +955,8 @@ fn unreadable_files_are_errors_not_new() {
     assert!(text.contains("cannot read"), "{text}");
     assert!(!text.contains("new at home"), "{text}");
 
-    let text = sb.ok(&["-y"]);
-    assert!(text.contains("nothing to save"), "{text}");
+    let text = sb.fail(&["-y"]);
+    assert!(text.contains("nothing saved; 1 path skipped"), "{text}");
     assert!(text.contains("! .config/app/secret"), "{text}");
     assert!(!sb.store_path(".config/app/secret").exists());
     fs::set_permissions(

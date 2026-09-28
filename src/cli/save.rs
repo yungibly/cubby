@@ -76,6 +76,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
 
     let scan = ctx.scanner().scan(&scope)?;
     let plan = plan::plan(&scan, &ctx.cfg.layout, Direction::Save, force);
+    failures += plan.troubled();
 
     for n in &scan.notes {
         ctx.warn(&format!("{}: {}", n.path, n.why));
@@ -98,11 +99,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
         if manifest_changed && !ctx.dry_run {
             ctx.manifest.save(&ctx.cfg.layout.store)?;
         }
-        println!(
-            "{} {}",
-            ctx.style.green("✓"),
-            ctx.style.dim("nothing to save, the store is up to date")
-        );
+        ctx.print_nothing_to_do(&plan, "nothing to save, the store is up to date");
         return Ok(if failures > 0 { 1 } else { 0 });
     }
 
@@ -128,7 +125,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
 
     if ctx.dry_run {
         ctx.note("dry run, nothing changed");
-        return Ok(0);
+        return Ok(if failures > 0 { 1 } else { 0 });
     }
     if !ctx.confirm(&format!(
         "save {}?",

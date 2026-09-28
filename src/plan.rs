@@ -58,16 +58,26 @@ impl RunKind {
         }
     }
 
+    /// "saved", as in "nothing saved".
+    pub fn past(self) -> &'static str {
+        match self {
+            RunKind::Save => "saved",
+            RunKind::Restore => "restored",
+            RunKind::Untrack => "removed",
+        }
+    }
+
     /// "saved 3 changes", for the line after a run.
     pub fn summary(self, done: usize) -> String {
         match self {
-            RunKind::Save => format!("saved {}", crate::ui::plural(done, "change", "changes")),
-            RunKind::Restore => {
-                format!("restored {}", crate::ui::plural(done, "change", "changes"))
-            }
             RunKind::Untrack => format!(
                 "removed {} from the store",
                 crate::ui::plural(done, "file", "files")
+            ),
+            _ => format!(
+                "{} {}",
+                self.past(),
+                crate::ui::plural(done, "change", "changes")
             ),
         }
     }
@@ -143,6 +153,15 @@ impl Plan {
     /// Size of everything the plan copies; for previews.
     pub fn bytes_to_copy(&self) -> u64 {
         self.actions.iter().map(|a| a.len).sum()
+    }
+
+    /// How many paths were skipped because of a conflict or an error: the
+    /// run cannot do everything it was asked to, so it exits with 1.
+    pub fn troubled(&self) -> usize {
+        self.skipped
+            .iter()
+            .filter(|s| matches!(s.why, Skip::Conflict(_) | Skip::Error(_)))
+            .count()
     }
 }
 
@@ -270,6 +289,9 @@ pub struct Outcome {
     pub failed: Vec<(Action, String)>,
     pub backup_dir: Option<PathBuf>,
     pub backed_up: usize,
+    /// Why the history could not be written, if it could not. That is
+    /// worth a warning but not worth stopping halfway through a run.
+    pub history_error: Option<String>,
 }
 
 /// Carry out a plan. `report` is called after each action with the result.
@@ -282,12 +304,17 @@ pub fn apply(
 ) -> Result<Outcome> {
     let mut done = 0;
     let mut failed = Vec::new();
+    let mut history_error = None;
     for action in &plan.actions {
         let result = perform(action, layout, backup.as_mut());
         match result {
             Ok(()) => {
                 done += 1;
-                history.record(op_name(action, plan.kind), &action.rel)?;
+                if let Err(e) = history.record(op_name(action, plan.kind), &action.rel)
+                    && history_error.is_none()
+                {
+                    history_error = Some(format!("{e:#}"));
+                }
                 report(action, Ok(()));
             }
             Err(e) => {
@@ -306,6 +333,7 @@ pub fn apply(
         failed,
         backup_dir,
         backed_up,
+        history_error,
     })
 }
 

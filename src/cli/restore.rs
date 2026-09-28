@@ -13,17 +13,14 @@ pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
     failures += ctx.report_unstored(&scope, &scan);
 
     let plan = plan::plan(&scan, &ctx.cfg.layout, Direction::Restore, force);
+    failures += plan.troubled();
     for n in &scan.notes {
         ctx.warn(&format!("{}: {}", n.path, n.why));
     }
 
     if plan.is_empty() {
         ctx.print_skipped(&plan);
-        println!(
-            "{} {}",
-            ctx.style.green("✓"),
-            ctx.style.dim("nothing to restore, home is up to date")
-        );
+        ctx.print_nothing_to_do(&plan, "nothing to restore, home is up to date");
         return Ok(if failures > 0 { 1 } else { 0 });
     }
 
@@ -43,7 +40,7 @@ pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
 
     if ctx.dry_run {
         ctx.note("dry run, nothing changed");
-        return Ok(0);
+        return Ok(if failures > 0 { 1 } else { 0 });
     }
     if !ctx.confirm(&format!(
         "restore {}?",

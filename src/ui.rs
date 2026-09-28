@@ -19,7 +19,17 @@ pub struct Style {
 }
 
 impl Style {
+    /// Colors for standard output.
     pub fn detect(choice: ColorChoice) -> Style {
+        Style::detect_for(choice, io::stdout().is_terminal())
+    }
+
+    /// Colors for standard error, where warnings, errors, and prompts go.
+    pub fn detect_stderr(choice: ColorChoice) -> Style {
+        Style::detect_for(choice, io::stderr().is_terminal())
+    }
+
+    fn detect_for(choice: ColorChoice, is_terminal: bool) -> Style {
         let enabled = match choice {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
@@ -31,8 +41,7 @@ impl Style {
                 {
                     true
                 } else {
-                    io::stdout().is_terminal()
-                        && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
+                    is_terminal && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
                 }
             }
         };
@@ -67,14 +76,17 @@ impl Style {
     }
 }
 
-/// Ask a yes/no question. Fails rather than hangs when stdin is not a
-/// terminal, so scripts must pass `--yes`.
+/// Ask a yes/no question on standard error, so it stays visible when output
+/// is redirected. Fails rather than hangs when stdin is not a terminal, so
+/// scripts must pass `--yes`. `style` should be the standard error style.
 pub fn confirm(question: &str, style: &Style) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!("{question} — stdin is not a terminal; pass --yes to skip the prompt");
     }
-    print!("{} {} {} ", style.yellow("?"), question, style.dim("[y/N]"));
+    // Anything already printed must come first.
     io::stdout().flush()?;
+    eprint!("{} {} {} ", style.yellow("?"), question, style.dim("[y/N]"));
+    io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     let answer = answer.trim().to_ascii_lowercase();

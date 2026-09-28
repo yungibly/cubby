@@ -180,7 +180,10 @@ pub struct Ctx {
     pub cfg: Config,
     pub manifest: Manifest,
     pub ignore: Ignore,
+    /// Colors for standard output.
     pub style: Style,
+    /// Colors for standard error: warnings, errors, and prompts.
+    pub estyle: Style,
     pub dry_run: bool,
     pub yes: bool,
     pub verbose: bool,
@@ -205,6 +208,7 @@ impl Ctx {
             manifest,
             ignore,
             style: Style::detect(global.color),
+            estyle: Style::detect_stderr(global.color),
             dry_run: global.dry_run,
             yes: global.yes,
             verbose: global.verbose,
@@ -305,11 +309,11 @@ impl Ctx {
     }
 
     pub fn error(&self, msg: &str) {
-        eprintln!("{} {msg}", self.style.red("error:"));
+        eprintln!("{} {msg}", self.estyle.red("error:"));
     }
 
     pub fn warn(&self, msg: &str) {
-        eprintln!("{} {msg}", self.style.yellow("warning:"));
+        eprintln!("{} {msg}", self.estyle.yellow("warning:"));
     }
 
     pub fn note(&self, msg: &str) {
@@ -321,7 +325,7 @@ impl Ctx {
         if self.yes {
             return Ok(true);
         }
-        ui::confirm(question, &self.style)
+        ui::confirm(question, &self.estyle)
     }
 
     /// Print the actions of a plan, grouped and capped unless verbose.
@@ -392,6 +396,23 @@ impl Ctx {
         }
     }
 
+    /// The line for a plan with nothing to do: `done` when that is because
+    /// everything is up to date, a pointer to the skipped paths otherwise.
+    pub fn print_nothing_to_do(&self, plan: &Plan, done: &str) {
+        match plan.troubled() {
+            0 => println!("{} {}", self.style.green("✓"), self.style.dim(done)),
+            n => println!(
+                "{} {}",
+                self.style.red("✗"),
+                self.style.dim(&format!(
+                    "nothing {}; {} skipped (see above)",
+                    plan.kind.past(),
+                    ui::plural(n, "path", "paths")
+                ))
+            ),
+        }
+    }
+
     /// Carry out a plan: back up, apply, report. Returns the exit code.
     pub fn run_plan(&self, plan: &Plan) -> Result<i32> {
         let backup = self
@@ -427,6 +448,9 @@ impl Ctx {
             ));
         }
         println!("{}", self.style.dim(&summary));
+        if let Some(e) = &outcome.history_error {
+            self.warn(&format!("could not record this run in the history: {e}"));
+        }
 
         if self.cfg.backups
             && let Err(e) = backup::prune(&self.cfg.state_dir, config::BACKUP_SETS_TO_KEEP)
@@ -470,10 +494,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// Parse arguments, run, and return the process exit code.
 pub fn run() -> i32 {
     let cli = Cli::parse();
+    let color = cli.global.color;
     match dispatch(cli) {
         Ok(code) => code,
         Err(e) => {
-            let style = Style::detect(ColorChoice::Auto);
+            let style = Style::detect_stderr(color);
             eprintln!("{} {e:#}", style.red("error:"));
             1
         }
