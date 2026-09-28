@@ -5,33 +5,51 @@
 //! tracked as a whole (so new files under them are picked up and deleted
 //! files are dropped from the store), and which patterns to ignore.
 //!
-//! It lives in the store so it is versioned and shared with it.
+//! It lives in the store so it is versioned and shared with it. cubby edits
+//! it in place, so comments people write in it survive.
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use toml_edit::DocumentMut;
 
 use crate::config::toml_string;
 use crate::fsx;
 use crate::paths::Rel;
+use crate::tomlx;
 
 pub const FILE_NAME: &str = ".cubby.toml";
+
+/// The manifest format this cubby writes. Version 1 is the unversioned
+/// format of cubby 2.
+pub const VERSION: i64 = 2;
 
 /// Ignore patterns written into a fresh manifest.
 pub const DEFAULT_IGNORE: &[&str] = &["*.swp", "*~", "__pycache__", "node_modules"];
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Manifest {
     /// Directories tracked as a whole, in normalized home-relative form.
     pub dirs: Vec<Rel>,
     /// Ignore patterns; see [`crate::ignore`] for the syntax.
     pub ignore: Vec<String>,
+    /// The file as written, edited in place so comments survive.
+    doc: DocumentMut,
+}
+
+impl PartialEq for Manifest {
+    fn eq(&self, other: &Manifest) -> bool {
+        self.dirs == other.dirs && self.ignore == other.ignore
+    }
 }
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Raw {
+    #[serde(default)]
+    #[allow(dead_code)] // checked before deserializing
+    version: Option<i64>,
     #[serde(default)]
     dirs: Vec<String>,
     #[serde(default)]
@@ -48,12 +66,39 @@ pub enum AddDir {
     Covered(Rel),
 }
 
+impl Default for Manifest {
+    /// A manifest with nothing in it, for a store that has none.
+    fn default() -> Manifest {
+        Manifest::from_template(&[])
+    }
+}
+
 impl Manifest {
+    /// The manifest `cubby init` writes.
     pub fn fresh() -> Manifest {
-        Manifest {
-            dirs: Vec::new(),
-            ignore: DEFAULT_IGNORE.iter().map(|s| s.to_string()).collect(),
+        Manifest::from_template(DEFAULT_IGNORE)
+    }
+
+    fn from_template(ignore: &[&str]) -> Manifest {
+        let mut text = String::from(
+            "# cubby manifest. Lives in the store and travels with it.\n\
+             #\n\
+             # dirs: directories tracked as a whole. `cubby` picks up new files under\n\
+             #       them and drops files from the store that you deleted at home.\n\
+             # ignore: never tracked. A pattern without a slash matches a file or\n\
+             #       directory name at any depth; one with a slash matches a path\n\
+             #       relative to your home directory (`**` is allowed).\n\
+             #\n\
+             # cubby keeps your comments when it updates this file.\n\n",
+        );
+        text.push_str(&format!(
+            "version = {VERSION}\n\ndirs = [\n]\n\nignore = [\n"
+        ));
+        for p in ignore {
+            text.push_str(&format!("  {},\n", toml_string(p)));
         }
+        text.push_str("]\n");
+        Manifest::parse(&text).expect("the manifest template parses")
     }
 
     pub fn path(store: &Path) -> std::path::PathBuf {
@@ -72,6 +117,19 @@ impl Manifest {
     }
 
     pub fn parse(text: &str) -> Result<Manifest> {
+        let doc: DocumentMut = text.parse()?;
+        // Check the version before anything else, so a store written by a
+        // newer cubby says so instead of failing on a key this one does
+        // not know.
+        if let Some(item) = doc.get("version") {
+            match item.as_integer() {
+                Some(v) if v > VERSION => bail!(
+                    "this store was written by a newer cubby (manifest version {v}; this cubby reads up to {VERSION}); upgrade cubby"
+                ),
+                Some(v) if v >= 1 => {}
+                _ => bail!("version must be a whole number, 1 or more"),
+            }
+        }
         let raw: Raw = toml::from_str(text)?;
         let mut dirs = Vec::new();
         for d in raw.dirs {
@@ -84,6 +142,7 @@ impl Manifest {
         Ok(Manifest {
             dirs,
             ignore: raw.ignore,
+            doc,
         })
     }
 
@@ -93,29 +152,11 @@ impl Manifest {
             .with_context(|| format!("cannot write {}", path.display()))
     }
 
+    /// The file's text, marked with the format version it now uses.
     pub fn render(&self) -> String {
-        let mut out = String::from(
-            "# cubby manifest. Lives in the store and travels with it.\n\
-             #\n\
-             # dirs: directories tracked as a whole. `cubby` picks up new files under\n\
-             #       them and drops files from the store that you deleted at home.\n\
-             # ignore: never tracked. A pattern without a slash matches a file or\n\
-             #       directory name at any depth; one with a slash matches a path\n\
-             #       relative to your home directory (`**` is allowed).\n\
-             #\n\
-             # cubby rewrites this file when tracked directories change, so keep\n\
-             # your own notes in the store's README rather than here.\n\n",
-        );
-        out.push_str("dirs = [\n");
-        for d in &self.dirs {
-            out.push_str(&format!("  {},\n", toml_string(&d.to_string())));
-        }
-        out.push_str("]\n\nignore = [\n");
-        for p in &self.ignore {
-            out.push_str(&format!("  {},\n", toml_string(p)));
-        }
-        out.push_str("]\n");
-        out
+        let mut doc = self.doc.clone();
+        tomlx::set_first(&mut doc, "version", toml_edit::value(VERSION));
+        doc.to_string()
     }
 
     /// The tracked directory that contains `rel` (or is `rel`), if any.
@@ -140,16 +181,43 @@ impl Manifest {
             .cloned()
             .collect();
         self.dirs.retain(|d| !d.is_within(&rel));
-        self.dirs.push(rel);
+        self.dirs.push(rel.clone());
         self.dirs.sort();
+
+        let array = tomlx::array_mut(&mut self.doc, "dirs").expect("dirs is a list");
+        tomlx::remove_where(array, |v| parses_within(v, &rel));
+        // Keep the list sorted: before the first entry that sorts after it.
+        let index = array
+            .iter()
+            .position(|v| {
+                v.as_str()
+                    .and_then(|s| Rel::parse(s).ok())
+                    .is_some_and(|d| d > rel)
+            })
+            .unwrap_or(array.len());
+        tomlx::insert_str(array, index, &rel.to_string());
         AddDir::Added { absorbed }
     }
 
     pub fn remove_dir(&mut self, rel: &Rel) -> bool {
         let before = self.dirs.len();
         self.dirs.retain(|d| d != rel);
-        before != self.dirs.len()
+        if before == self.dirs.len() {
+            return false;
+        }
+        let array = tomlx::array_mut(&mut self.doc, "dirs").expect("dirs is a list");
+        tomlx::remove_where(array, |v| {
+            v.as_str().and_then(|s| Rel::parse(s).ok()).as_ref() == Some(rel)
+        });
+        true
     }
+}
+
+/// Whether an array element names `rel` or a directory inside it.
+fn parses_within(v: &toml_edit::Value, rel: &Rel) -> bool {
+    v.as_str()
+        .and_then(|s| Rel::parse(s).ok())
+        .is_some_and(|d| d.is_within(rel))
 }
 
 #[cfg(test)]
@@ -168,6 +236,7 @@ mod tests {
         let parsed = Manifest::parse(&m.render()).unwrap();
         assert_eq!(parsed, m);
         assert_eq!(parsed.dirs, vec![rel(".config/fish"), rel(".config/nvim")]);
+        assert!(m.render().contains("version = 2\n"));
     }
 
     #[test]
@@ -187,10 +256,27 @@ mod tests {
         let mut m = Manifest::fresh();
         for n in names {
             m.add_dir(rel(&format!(".config/{n}")));
-            m.ignore.push(n.to_owned());
         }
         let parsed = Manifest::parse(&m.render()).unwrap();
         assert_eq!(parsed, m);
+    }
+
+    #[test]
+    fn comments_survive_edits() {
+        let text = "# my dotfiles\n\
+                    dirs = [\n  \"~/.config/nvim\",\n]\n\n\
+                    ignore = [\n  # plugin manager lock file\n  \"lazy-lock.json\",\n]\n";
+        let mut m = Manifest::parse(text).unwrap();
+        m.add_dir(rel(".config/fish"));
+        m.remove_dir(&rel(".config/nvim"));
+        let out = m.render();
+        assert_eq!(
+            out,
+            "# my dotfiles\nversion = 2\n\n\
+             dirs = [\n  \"~/.config/fish\",\n]\n\n\
+             ignore = [\n  # plugin manager lock file\n  \"lazy-lock.json\",\n]\n"
+        );
+        assert_eq!(Manifest::parse(&out).unwrap(), m);
     }
 
     #[test]
@@ -200,6 +286,14 @@ mod tests {
         assert!(m.ignore.is_empty());
         assert!(Manifest::parse("dirs = ['../x']").is_err());
         assert!(Manifest::parse("dir = []").is_err());
+    }
+
+    #[test]
+    fn newer_versions_ask_for_an_upgrade() {
+        let err = Manifest::parse("version = 99\nshiny = true\n").unwrap_err();
+        assert!(err.to_string().contains("upgrade cubby"), "{err}");
+        assert!(Manifest::parse("version = 1\ndirs = []\n").is_ok());
+        assert!(Manifest::parse("version = 'two'\n").is_err());
     }
 
     #[test]
@@ -220,9 +314,11 @@ mod tests {
             }
         );
         assert_eq!(m.dirs, vec![rel(".config")]);
+        assert_eq!(Manifest::parse(&m.render()).unwrap().dirs, m.dirs);
         assert_eq!(m.dir_for(&rel(".config/foo/bar")), Some(&rel(".config")));
         assert_eq!(m.dir_for(&rel(".configx")), None);
         assert!(m.remove_dir(&rel(".config")));
         assert!(!m.remove_dir(&rel(".config")));
+        assert!(Manifest::parse(&m.render()).unwrap().dirs.is_empty());
     }
 }

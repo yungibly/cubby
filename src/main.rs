@@ -10,6 +10,7 @@ mod paths;
 mod plan;
 mod scan;
 mod testutil;
+mod tomlx;
 mod ui;
 
 fn main() {

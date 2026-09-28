@@ -1065,6 +1065,31 @@ fn cubbys_own_config_and_state_are_never_tracked() {
 }
 
 #[test]
+fn manifest_comments_survive_and_version_is_added() {
+    let sb = Sandbox::ready();
+    // A cubby 2 manifest, with notes someone wrote.
+    fs::write(
+        sb.store_path(".cubby.toml"),
+        "# my notes\ndirs = [\n]\n\nignore = [\n  # neovim plugin lock file\n  \"lazy-lock.json\",\n]\n",
+    )
+    .unwrap();
+    sb.write_home(".config/nvim/init.lua", "a\n");
+    sb.ok(&["~/.config/nvim", "-y"]);
+    let m = sb.manifest();
+    assert!(m.starts_with("# my notes\nversion = 2\n"), "{m}");
+    assert!(
+        m.contains("# neovim plugin lock file\n  \"lazy-lock.json\""),
+        "{m}"
+    );
+    assert!(m.contains("dirs = [\n  \"~/.config/nvim\",\n]"), "{m}");
+
+    // A store written by a newer cubby asks for an upgrade.
+    fs::write(sb.store_path(".cubby.toml"), "version = 9\nshiny = 1\n").unwrap();
+    let text = sb.fail(&["status"]);
+    assert!(text.contains("upgrade cubby"), "{text}");
+}
+
+#[test]
 fn unusual_directory_names_keep_the_manifest_readable() {
     let sb = Sandbox::ready();
     let name = ".config/notes-\u{1F469}\u{200D}\u{1F4BB} \"quoted\"";
