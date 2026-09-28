@@ -2,7 +2,8 @@
 //!
 //! `save` copies home → store and, under tracked directories, removes store
 //! files that were deleted at home. `restore` copies store → home and never
-//! removes anything. Both back up whatever they overwrite or remove.
+//! removes anything. `untrack` removes files from the store. All of them
+//! back up whatever they overwrite or remove.
 
 use std::path::PathBuf;
 
@@ -12,8 +13,9 @@ use crate::backup::Backup;
 use crate::fsx;
 use crate::history::History;
 use crate::paths::{Layout, Rel};
-use crate::scan::{Entry, Newer, Scan, State};
+use crate::scan::{Newer, Scan, State};
 
+/// Which way a save or restore copies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     /// home → store
@@ -23,17 +25,50 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// The side this direction writes.
+    pub fn writes(self) -> Side {
+        match self {
+            Direction::Save => Side::Store,
+            Direction::Restore => Side::Home,
+        }
+    }
+}
+
+/// One side of the mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Home,
+    Store,
+}
+
+/// What a run of cubby is doing, for messages, backups, and history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunKind {
+    Save,
+    Restore,
+    Untrack,
+}
+
+impl RunKind {
     pub fn verb(self) -> &'static str {
         match self {
-            Direction::Save => "save",
-            Direction::Restore => "restore",
+            RunKind::Save => "save",
+            RunKind::Restore => "restore",
+            RunKind::Untrack => "untrack",
         }
     }
 
-    pub fn past(self) -> &'static str {
+    /// "saved 3 changes", for the line after a run.
+    pub fn summary(self, done: usize) -> String {
         match self {
-            Direction::Save => "saved",
-            Direction::Restore => "restored",
+            RunKind::Save => format!("saved {}", crate::ui::plural(done, "change", "changes")),
+            RunKind::Restore => {
+                format!("restored {}", crate::ui::plural(done, "change", "changes"))
+            }
+            RunKind::Untrack => format!(
+                "removed {} from the store",
+                crate::ui::plural(done, "file", "files")
+            ),
         }
     }
 }
@@ -44,7 +79,7 @@ pub enum Op {
     Create,
     /// Replace the destination.
     Overwrite,
-    /// Remove from the store (save only).
+    /// Remove the destination.
     Remove,
 }
 
@@ -52,12 +87,16 @@ pub enum Op {
 pub struct Action {
     pub rel: Rel,
     pub op: Op,
+    /// The side that gets written.
+    pub side: Side,
     /// Short explanation shown next to the path.
     pub note: String,
     /// Where to copy from (absent for removals).
     pub src: Option<PathBuf>,
     /// The path that gets written or removed.
     pub dst: PathBuf,
+    /// Bytes copied (zero for removals).
+    pub len: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,12 +118,20 @@ pub struct Skipped {
 
 #[derive(Clone, Debug)]
 pub struct Plan {
-    pub direction: Direction,
+    pub kind: RunKind,
     pub actions: Vec<Action>,
     pub skipped: Vec<Skipped>,
 }
 
 impl Plan {
+    pub fn new(kind: RunKind) -> Plan {
+        Plan {
+            kind,
+            actions: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
     }
@@ -92,15 +139,23 @@ impl Plan {
     pub fn count(&self, op: Op) -> usize {
         self.actions.iter().filter(|a| a.op == op).count()
     }
+
+    /// Size of everything the plan copies; for previews.
+    pub fn bytes_to_copy(&self) -> u64 {
+        self.actions.iter().map(|a| a.len).sum()
+    }
 }
 
+/// Plan a save or a restore of everything in `scan`.
 pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> Plan {
-    let mut actions = Vec::new();
-    let mut skipped = Vec::new();
+    let kind = match direction {
+        Direction::Save => RunKind::Save,
+        Direction::Restore => RunKind::Restore,
+    };
+    let mut plan = Plan::new(kind);
     for e in &scan.entries {
-        let rel = e.rel.clone();
         let skip = |why: Skip| Skipped {
-            rel: rel.clone(),
+            rel: e.rel.clone(),
             why,
         };
         // Real on-disk paths where they exist, the mirrored path otherwise.
@@ -115,13 +170,9 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
             .map(|m| m.path.clone())
             .unwrap_or_else(|| layout.stored(&e.rel));
         let copy = |op: Op, mut note: String| {
-            let (src, dst) = match direction {
-                Direction::Save => (home_path.clone(), store_path.clone()),
-                Direction::Restore => (store_path.clone(), home_path.clone()),
-            };
-            let src_meta = match direction {
-                Direction::Save => e.home.as_ref(),
-                Direction::Restore => e.store.as_ref(),
+            let (src, src_meta, dst) = match direction {
+                Direction::Save => (home_path.clone(), e.home.as_ref(), store_path.clone()),
+                Direction::Restore => (store_path.clone(), e.store.as_ref(), home_path.clone()),
             };
             if let Some(m) = src_meta
                 && let Some(target) = &m.target
@@ -136,9 +187,11 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
             Action {
                 rel: e.rel.clone(),
                 op,
+                side: direction.writes(),
                 note,
                 src: Some(src),
                 dst,
+                len: src_meta.map_or(0, |m| m.len),
             }
         };
         match (&e.state, direction) {
@@ -149,23 +202,26 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
                     (Newer::Home, Direction::Restore) => ", home copy is newer",
                     _ => "",
                 };
-                actions.push(copy(Op::Overwrite, format!("modified{warn}")));
+                plan.actions
+                    .push(copy(Op::Overwrite, format!("modified{warn}")));
             }
-            (State::New, Direction::Save) => actions.push(copy(Op::Create, "new".into())),
-            (State::New, Direction::Restore) => skipped.push(skip(Skip::NewAtHome)),
-            (State::Missing { deleted: true }, Direction::Save) => actions.push(Action {
+            (State::New, Direction::Save) => plan.actions.push(copy(Op::Create, "new".into())),
+            (State::New, Direction::Restore) => plan.skipped.push(skip(Skip::NewAtHome)),
+            (State::Missing { deleted: true }, Direction::Save) => plan.actions.push(Action {
                 rel: e.rel.clone(),
                 op: Op::Remove,
+                side: Side::Store,
                 note: "deleted at home".into(),
                 src: None,
                 dst: store_path.clone(),
+                len: 0,
             }),
             (State::Missing { deleted: false }, Direction::Save) => {
-                skipped.push(skip(Skip::MissingAtHome))
+                plan.skipped.push(skip(Skip::MissingAtHome))
             }
-            (State::Missing { .. }, Direction::Restore) => {
-                actions.push(copy(Op::Create, "missing at home".into()))
-            }
+            (State::Missing { .. }, Direction::Restore) => plan
+                .actions
+                .push(copy(Op::Create, "missing at home".into())),
             (State::Conflict { home, store }, dir) => {
                 let text = format!(
                     "home has {}, store has {}",
@@ -179,33 +235,34 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
                         Direction::Save => format!("{text}; replacing the store copy"),
                         Direction::Restore => format!("{text}; replacing the home copy"),
                     };
-                    actions.push(copy(Op::Overwrite, note));
+                    plan.actions.push(copy(Op::Overwrite, note));
                 } else {
-                    skipped.push(skip(Skip::Conflict(text)));
+                    plan.skipped.push(skip(Skip::Conflict(text)));
                 }
             }
-            (State::Error(msg), _) => skipped.push(skip(Skip::Error(msg.clone()))),
+            (State::Error(msg), _) => plan.skipped.push(skip(Skip::Error(msg.clone()))),
         }
     }
-    Plan {
-        direction,
-        actions,
-        skipped,
-    }
+    plan
 }
 
-/// Size at home of everything a plan would copy; for previews.
-pub fn bytes_to_copy(plan: &Plan, scan: &Scan) -> u64 {
-    plan.actions
-        .iter()
-        .filter(|a| a.op != Op::Remove)
-        .filter_map(|a| scan.entries.iter().find(|e| e.rel == a.rel))
-        .filter_map(|e: &Entry| match plan.direction {
-            Direction::Save => e.home.as_ref(),
-            Direction::Restore => e.store.as_ref(),
-        })
-        .map(|m| m.len)
-        .sum()
+/// Plan removing every file of `scan` from the store.
+pub fn untrack_plan(scan: &Scan) -> Plan {
+    let mut plan = Plan::new(RunKind::Untrack);
+    for e in &scan.entries {
+        if let Some(m) = &e.store {
+            plan.actions.push(Action {
+                rel: e.rel.clone(),
+                op: Op::Remove,
+                side: Side::Store,
+                note: String::new(),
+                src: None,
+                dst: m.path.clone(),
+                len: 0,
+            });
+        }
+    }
+    plan
 }
 
 pub struct Outcome {
@@ -230,7 +287,7 @@ pub fn apply(
         match result {
             Ok(()) => {
                 done += 1;
-                history.record(op_name(action, plan.direction), &action.rel)?;
+                history.record(op_name(action, plan.kind), &action.rel)?;
                 report(action, Ok(()));
             }
             Err(e) => {
@@ -252,16 +309,22 @@ pub fn apply(
     })
 }
 
-fn op_name(action: &Action, direction: Direction) -> &'static str {
-    match (action.op, direction) {
-        (Op::Remove, _) => "remove",
-        (_, Direction::Save) => "save",
-        (_, Direction::Restore) => "restore",
+fn op_name(action: &Action, kind: RunKind) -> &'static str {
+    match (action.op, action.side, kind) {
+        (Op::Remove, _, RunKind::Untrack) => "untrack",
+        (Op::Remove, _, _) => "remove",
+        (_, Side::Store, _) => "save",
+        (_, Side::Home, _) => "restore",
     }
 }
 
 fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Result<()> {
     let rel = &action.rel;
+    // Removed directories are pruned up to the root of the side written.
+    let root = match action.side {
+        Side::Home => &layout.home,
+        Side::Store => &layout.store,
+    };
     match action.op {
         Op::Remove => {
             if let Some(meta) = fsx::lstat(&action.dst)?
@@ -269,7 +332,7 @@ fn perform(action: &Action, layout: &Layout, backup: Option<&mut Backup>) -> Res
             {
                 b.stash(rel, &action.dst, &meta)?;
             }
-            fsx::remove_entry(&action.dst, &layout.store)
+            fsx::remove_entry(&action.dst, root)
         }
         Op::Create | Op::Overwrite => {
             let src = action

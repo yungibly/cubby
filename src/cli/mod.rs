@@ -21,7 +21,7 @@ use crate::ignore::Ignore;
 use crate::manifest::Manifest;
 use crate::paths::Rel;
 use crate::plan::{self, Op, Plan, Skip};
-use crate::scan::Scanner;
+use crate::scan::{Scan, Scanner, Scope};
 use crate::ui::{self, ColorChoice, Style};
 
 const LONG_ABOUT: &str = "\
@@ -252,6 +252,37 @@ impl Ctx {
         );
     }
 
+    /// The scope for a command's paths (everything when there are none),
+    /// and how many paths failed to resolve. `None` when paths were given
+    /// and none of them resolved; the errors have been reported.
+    pub fn scope_for(&self, paths: &[String]) -> Option<(Scope, usize)> {
+        let (rels, failures) = self.resolve_paths(paths);
+        if paths.is_empty() {
+            Some((Scope::all(), failures))
+        } else if rels.is_empty() {
+            None
+        } else {
+            Some((Scope::of(rels), failures))
+        }
+    }
+
+    /// Report each named path that has nothing in the store beneath it.
+    /// Returns how many there were.
+    pub fn report_unstored(&self, scope: &Scope, scan: &Scan) -> usize {
+        let mut missing = 0;
+        for rel in &scope.rels {
+            if !scan
+                .entries
+                .iter()
+                .any(|e| e.rel.is_within(rel) && e.store.is_some())
+            {
+                self.error(&format!("nothing in the store at {rel}"));
+                missing += 1;
+            }
+        }
+        missing
+    }
+
     /// Resolve command-line paths, reporting each failure and returning the
     /// ones that resolved.
     pub fn resolve_paths(&self, paths: &[String]) -> (Vec<Rel>, usize) {
@@ -366,7 +397,7 @@ impl Ctx {
         let backup = self
             .cfg
             .backups
-            .then(|| Backup::new(&self.cfg.state_dir, plan.direction.verb()));
+            .then(|| Backup::new(&self.cfg.state_dir, plan.kind.verb()));
         let history = self.history();
         // The plan was already printed; only failures need a line of their own.
         let outcome = plan::apply(
@@ -384,11 +415,7 @@ impl Ctx {
             },
         )?;
 
-        let mut summary = format!(
-            "{} {}",
-            plan.direction.past(),
-            ui::plural(outcome.done, "change", "changes")
-        );
+        let mut summary = plan.kind.summary(outcome.done);
         if !outcome.failed.is_empty() {
             summary.push_str(&format!(", {} failed", outcome.failed.len()));
         }

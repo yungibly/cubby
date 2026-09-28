@@ -1,10 +1,9 @@
 use anyhow::Result;
 
 use super::Ctx;
-use crate::backup::{self, Backup};
-use crate::config;
 use crate::fsx;
 use crate::paths::Rel;
+use crate::plan;
 use crate::scan::Scope;
 use crate::ui;
 
@@ -41,11 +40,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     }
 
     let scan = ctx.scanner().scan(&Scope::of(scope_rels.clone()))?;
-    let files: Vec<(Rel, std::path::PathBuf)> = scan
-        .entries
-        .iter()
-        .filter_map(|e| e.store.as_ref().map(|m| (e.rel.clone(), m.path.clone())))
-        .collect();
+    let plan = plan::untrack_plan(&scan);
 
     println!("{} {}", ctx.style.bold("untrack ←"), ctx.store_label());
     for d in &dirs_to_drop {
@@ -59,23 +54,10 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
             )
         );
     }
-    let cap = if ctx.verbose { usize::MAX } else { 40 };
-    for (i, (rel, _)) in files.iter().enumerate() {
-        if i == cap {
-            ctx.note(&format!(
-                "  … and {} more (use --verbose to list all)",
-                files.len() - cap
-            ));
-            break;
-        }
-        println!(
-            "{}",
-            ui::row(&ctx.style, &ctx.style.red("-"), rel.as_str(), "")
-        );
-    }
+    ctx.print_plan(&plan);
     ctx.note(&format!(
         "  {} to remove from the store; home is left untouched",
-        ui::plural(files.len(), "file", "files")
+        ui::plural(plan.actions.len(), "file", "files")
     ));
 
     if ctx.dry_run {
@@ -84,48 +66,14 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     }
     if !ctx.confirm(&format!(
         "untrack {}?",
-        ui::plural(files.len().max(dirs_to_drop.len()), "path", "paths")
+        ui::plural(plan.actions.len().max(dirs_to_drop.len()), "path", "paths")
     ))? {
         ctx.note("aborted");
         return Ok(1);
     }
 
-    let history = ctx.history();
-    let mut backup = ctx
-        .cfg
-        .backups
-        .then(|| Backup::new(&ctx.cfg.state_dir, "untrack"));
-    let mut removed = 0;
-    for (rel, path) in &files {
-        let result = (|| -> Result<()> {
-            if let Some(meta) = fsx::lstat(path)?
-                && let Some(b) = backup.as_mut()
-            {
-                b.stash(rel, path, &meta)?;
-            }
-            fsx::remove_entry(path, &ctx.cfg.layout.store)
-        })();
-        match result {
-            Ok(()) => {
-                removed += 1;
-                history.record("untrack", rel)?;
-            }
-            Err(e) => {
-                failures += 1;
-                println!(
-                    "{}",
-                    ui::row(
-                        &ctx.style,
-                        &ctx.style.red("✗"),
-                        rel.as_str(),
-                        &format!("{e:#}")
-                    )
-                );
-            }
-        }
-    }
-    // Empty directories left behind (from tracked directories with no files
-    // left) are pruned too.
+    let code = ctx.run_plan(&plan)?;
+    // Directories left empty in the store go too.
     for rel in &scope_rels {
         fsx::prune_empty_dirs(Some(&ctx.cfg.layout.stored(rel)), &ctx.cfg.layout.store);
     }
@@ -136,24 +84,5 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     if manifest_changed {
         ctx.manifest.save(&ctx.cfg.layout.store)?;
     }
-
-    let mut summary = format!(
-        "removed {} from the store",
-        ui::plural(removed, "file", "files")
-    );
-    if let Some(b) = &backup
-        && b.count() > 0
-    {
-        summary.push_str(&format!(
-            " · backed up to {}",
-            ctx.cfg.layout.pretty(b.dir())
-        ));
-    }
-    ctx.note(&summary);
-    if ctx.cfg.backups
-        && let Err(e) = backup::prune(&ctx.cfg.state_dir, config::BACKUP_SETS_TO_KEEP)
-    {
-        ctx.warn(&format!("could not prune old backups: {e:#}"));
-    }
-    Ok(if failures > 0 { 1 } else { 0 })
+    Ok(if failures > 0 { 1 } else { code })
 }

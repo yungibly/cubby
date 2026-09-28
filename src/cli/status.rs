@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::Ctx;
-use crate::scan::{Newer, Scope, State};
+use crate::scan::{Newer, State};
 use crate::ui;
 
 pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
@@ -16,14 +16,8 @@ pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
         };
     }
     ctx.require_store()?;
-    let (rels, failures) = ctx.resolve_paths(paths);
-    if !paths.is_empty() && rels.is_empty() {
+    let Some((scope, failures)) = ctx.scope_for(paths) else {
         return Ok(1);
-    }
-    let scope = if paths.is_empty() {
-        Scope::all()
-    } else {
-        Scope::of(rels)
     };
     let scan = ctx.scanner().scan(&scope)?;
     let style = &ctx.style;
@@ -186,14 +180,8 @@ pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
 
 fn run_quiet(ctx: &Ctx, paths: &[String]) -> Result<i32> {
     ctx.require_store()?;
-    let (rels, failures) = ctx.resolve_paths(paths);
-    if failures > 0 {
+    let Some((scope, 0)) = ctx.scope_for(paths) else {
         return Ok(2);
-    }
-    let scope = if paths.is_empty() {
-        Scope::all()
-    } else {
-        Scope::of(rels)
     };
     let scan = ctx.scanner().scan(&scope)?;
     let dirty = scan

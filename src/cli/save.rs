@@ -112,7 +112,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
 
     let copies = plan.count(Op::Create) + plan.count(Op::Overwrite);
     let removals = plan.count(Op::Remove);
-    let bytes = plan::bytes_to_copy(&plan, &scan);
+    let bytes = plan.bytes_to_copy();
     let mut summary = format!(
         "{} ({})",
         ui::plural(copies, "file to copy", "files to copy"),

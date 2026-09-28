@@ -2,33 +2,15 @@ use anyhow::Result;
 
 use super::Ctx;
 use crate::plan::{self, Direction, Op};
-use crate::scan::Scope;
 use crate::ui;
 
 pub fn run(ctx: &Ctx, paths: &[String], force: bool) -> Result<i32> {
     ctx.require_store()?;
-    let (rels, mut failures) = ctx.resolve_paths(paths);
-    if !paths.is_empty() && rels.is_empty() {
+    let Some((scope, mut failures)) = ctx.scope_for(paths) else {
         return Ok(1);
-    }
-    let scope = if paths.is_empty() {
-        Scope::all()
-    } else {
-        Scope::of(rels)
     };
     let scan = ctx.scanner().scan(&scope)?;
-
-    // Point out named paths that have nothing in the store.
-    for rel in &scope.rels {
-        if !scan
-            .entries
-            .iter()
-            .any(|e| e.rel.is_within(rel) && e.store.is_some())
-        {
-            ctx.error(&format!("nothing in the store at {rel}"));
-            failures += 1;
-        }
-    }
+    failures += ctx.report_unstored(&scope, &scan);
 
     let plan = plan::plan(&scan, &ctx.cfg.layout, Direction::Restore, force);
     for n in &scan.notes {
