@@ -22,8 +22,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         }
         if let Some(dir) = ctx.manifest.dir_for(&rel) {
             ctx.error(&format!(
-                "{rel} is inside the tracked directory {dir}; add an ignore pattern to {} or untrack {dir}",
-                crate::manifest::FILE_NAME
+                "{rel} is inside the tracked directory {dir}; to stop tracking it, run `cubby ignore {rel}`"
             ));
             failures += 1;
             continue;
@@ -39,7 +38,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         return Ok(1);
     }
 
-    let scan = ctx.scanner().scan(&Scope::of(scope_rels.clone()))?;
+    let scan = ctx.shared_scanner().scan(&Scope::of(scope_rels.clone()))?;
     let plan = plan::untrack_plan(&scan);
 
     println!("{} {}", ctx.style.bold("untrack ←"), ctx.store_label());
@@ -83,7 +82,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     }
     // Permission records for what left the store go with it: records of
     // untracked files, and of directories that no longer hold anything.
-    let remaining = ctx.scanner().store_entries()?;
+    let remaining = ctx.shared_scanner().store_entries()?;
     let stale: Vec<Rel> = ctx
         .manifest
         .modes

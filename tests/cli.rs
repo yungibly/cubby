@@ -841,6 +841,96 @@ fn private_permissions_survive_a_fresh_clone() {
 }
 
 #[test]
+fn skip_leaves_paths_alone_on_this_machine() {
+    let sb = Sandbox::ready();
+    // Another machine saved its macOS-only settings.
+    sb.write_store(".config/aerospace/aerospace.toml", "gaps = 8\n");
+    sb.write_store(".zshrc", "z\n");
+    sb.write_home(".zshrc", "z\n");
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(1));
+
+    let text = sb.ok(&["ignore", "--here", "~/.config/aerospace"]);
+    assert!(
+        text.contains("skipping \"~/.config/aerospace\" on this machine"),
+        "{text}"
+    );
+    let config = fs::read_to_string(sb.home.join(".config/cubby/config.toml")).unwrap();
+    assert!(
+        config.contains("skip = [\n  \"~/.config/aerospace\",\n]"),
+        "{config}"
+    );
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(0));
+    let text = sb.ok(&["restore", "-y"]);
+    assert!(text.contains("nothing to restore"), "{text}");
+    assert!(!sb.home_path(".config/aerospace").exists());
+    let text = sb.fail(&["restore", "~/.config/aerospace", "-y"]);
+    assert!(text.contains("skipped on this machine"), "{text}");
+    let text = sb.ok(&["status", "~/.config/aerospace"]);
+    assert!(
+        text.contains("skipped on this machine (skip pattern"),
+        "{text}"
+    );
+
+    // Still in the store: listed, and untrackable from here.
+    let text = sb.ok(&["list"]);
+    assert!(
+        text.contains("aerospace.toml skipped on this machine"),
+        "{text}"
+    );
+    assert!(text.contains("1 skipped on this machine"), "{text}");
+    let text = sb.ok(&["ignore"]);
+    assert!(
+        text.contains("skipped on this machine") && text.contains("~/.config/aerospace"),
+        "{text}"
+    );
+    sb.ok(&["ignore", "--here", "--remove", "~/.config/aerospace"]);
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(1));
+    sb.ok(&["ignore", "--here", "~/.config/aerospace"]);
+    sb.ok(&["untrack", "~/.config/aerospace/aerospace.toml", "-y"]);
+    assert!(!sb.store_path(".config/aerospace").exists());
+}
+
+#[test]
+fn ignore_adds_patterns_and_offers_to_drop_matching_files() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/nvim/init.lua", "a\n");
+    sb.write_home(".config/nvim/lazy-lock.json", "{}\n");
+    sb.ok(&["~/.config/nvim", "-y"]);
+    let text = sb.fail(&["untrack", "~/.config/nvim/lazy-lock.json", "-y"]);
+    assert!(
+        text.contains("run `cubby ignore ~/.config/nvim/lazy-lock.json`"),
+        "{text}"
+    );
+
+    let text = sb.ok(&["ignore", "lazy-lock.json", "-y"]);
+    assert!(
+        text.contains("ignoring \"lazy-lock.json\" on every machine"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 file already in the store is ignored now"),
+        "{text}"
+    );
+    assert!(text.contains("removed 1 file from the store"), "{text}");
+    assert!(!sb.store_path(".config/nvim/lazy-lock.json").exists());
+    assert!(sb.home_path(".config/nvim/lazy-lock.json").exists());
+    assert!(sb.manifest().contains("  \"lazy-lock.json\",\n]"));
+    let text = sb.ok(&["status"]);
+    assert!(!text.contains("lazy-lock"), "{text}");
+
+    // A path the shell expanded is written relative to home.
+    let abs = sb.home_path(".config/nvim/scratch.lua");
+    sb.ok(&["ignore", abs.to_str().unwrap(), "-y"]);
+    assert!(sb.manifest().contains("\"~/.config/nvim/scratch.lua\""));
+    sb.ok(&["ignore", "--remove", "~/.config/nvim/scratch.lua"]);
+    assert!(!sb.manifest().contains("scratch.lua"));
+    let text = sb.fail(&["ignore", "--remove", "never-there"]);
+    assert!(text.contains("is not an ignore pattern"), "{text}");
+    let text = sb.fail(&["ignore", "["]);
+    assert!(text.contains("invalid ignore pattern"), "{text}");
+}
+
+#[test]
 fn history_lists_operations() {
     let sb = Sandbox::ready();
     let text = sb.ok(&["history"]);

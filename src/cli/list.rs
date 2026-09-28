@@ -8,7 +8,7 @@ use crate::ui::{self, Tree};
 
 pub fn run(ctx: &Ctx, plain: bool) -> Result<i32> {
     ctx.require_store()?;
-    let entries = ctx.scanner().store_entries()?;
+    let entries = ctx.shared_scanner().store_entries()?;
 
     if plain {
         for (rel, _) in &entries {
@@ -38,6 +38,7 @@ pub fn run(ctx: &Ctx, plain: bool) -> Result<i32> {
         tree.insert(dir.as_str(), Some(note), false);
     }
     let mut symlinks = 0;
+    let mut skipped = 0;
     for (rel, meta) in &entries {
         let mut notes = Vec::new();
         if meta.kind == Kind::Symlink {
@@ -51,6 +52,10 @@ pub fn run(ctx: &Ctx, plain: bool) -> Result<i32> {
             ));
         }
         notes.extend(mode(rel));
+        if ctx.ignore.is_ignored(rel) {
+            skipped += 1;
+            notes.push("skipped on this machine".to_owned());
+        }
         let note = (!notes.is_empty()).then(|| notes.join(", "));
         tree.insert(rel.as_str(), note, true);
     }
@@ -83,6 +88,9 @@ pub fn run(ctx: &Ctx, plain: bool) -> Result<i32> {
                 "tracked directories"
             )
         ));
+    }
+    if skipped > 0 {
+        summary.push_str(&format!(" · {skipped} skipped on this machine"));
     }
     println!("{}", ctx.style.dim(&summary));
     Ok(0)

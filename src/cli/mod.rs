@@ -2,6 +2,7 @@
 
 mod diff;
 mod history;
+mod ignore;
 mod init;
 mod list;
 mod restore;
@@ -147,6 +148,21 @@ enum Command {
         #[arg(value_name = "PATH", required = true, value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
     },
+    /// Ignore files on every machine, or skip them on this one
+    ///
+    /// A pattern without a slash matches a name at any depth (`*.swp`); one
+    /// with a slash matches a path from home (`~/.config/nvim/lazy-lock.json`).
+    /// With no patterns, lists what is ignored.
+    Ignore {
+        #[arg(value_name = "PATTERN")]
+        patterns: Vec<String>,
+        /// Only on this machine: add to `skip` in config.toml, not the store
+        #[arg(long)]
+        here: bool,
+        /// Remove the patterns instead of adding them
+        #[arg(long)]
+        remove: bool,
+    },
     /// Show what cubby has done
     History {
         /// How many entries to show
@@ -180,7 +196,12 @@ enum Command {
 pub struct Ctx {
     pub cfg: Config,
     pub manifest: Manifest,
+    /// Everything this machine leaves alone: the manifest's patterns and
+    /// the config file's `skip` list.
     pub ignore: Ignore,
+    /// What every machine leaves alone: the manifest's patterns only. For
+    /// commands about the store as a whole, like `list` and `untrack`.
+    pub shared: Ignore,
     /// Colors for standard output.
     pub style: Style,
     /// Colors for standard error: warnings, errors, and prompts.
@@ -198,16 +219,13 @@ impl Ctx {
             no_backup: global.no_backup,
         })?;
         let manifest = Manifest::load(&cfg.layout.store)?;
-        let mut ignore = Ignore::new(&manifest.ignore)?;
-        for (path, why) in cfg.own_paths() {
-            if let Ok(rel) = Rel::from_path_under(&cfg.layout.home, &path) {
-                ignore.reserve(rel, why);
-            }
-        }
+        let ignore = ignore_rules(&cfg, &manifest, &cfg.skip)?;
+        let shared = ignore_rules(&cfg, &manifest, &[])?;
         Ok(Ctx {
             cfg,
             manifest,
             ignore,
+            shared,
             style: Style::detect(global.color),
             estyle: Style::detect_stderr(global.color),
             dry_run: global.dry_run,
@@ -216,7 +234,17 @@ impl Ctx {
         })
     }
 
+    /// A scanner that sees what this machine syncs.
     pub fn scanner(&self) -> Scanner<'_> {
+        self.scanner_with(&self.ignore)
+    }
+
+    /// A scanner that also sees what this machine skips.
+    pub fn shared_scanner(&self) -> Scanner<'_> {
+        self.scanner_with(&self.shared)
+    }
+
+    fn scanner_with<'a>(&'a self, ignore: &'a Ignore) -> Scanner<'a> {
         // The store, cubby's state, and its config are never walked into or
         // copied, whatever path leads to them.
         let own = std::iter::once(self.cfg.layout.store.clone())
@@ -227,7 +255,7 @@ impl Ctx {
         Scanner {
             layout: &self.cfg.layout,
             manifest: &self.manifest,
-            ignore: &self.ignore,
+            ignore,
             own,
         }
     }
@@ -271,12 +299,15 @@ impl Ctx {
         }
     }
 
-    /// Report each named path that has nothing in the store beneath it.
-    /// Returns how many there were.
+    /// Report each named path that has nothing in the store beneath it, or
+    /// that is ignored. Returns how many there were.
     pub fn report_unstored(&self, scope: &Scope, scan: &Scan) -> usize {
         let mut missing = 0;
         for rel in &scope.rels {
-            if !scan
+            if let Some(reason) = self.ignore.reason(rel) {
+                self.error(&format!("{rel} is ignored: {reason}"));
+                missing += 1;
+            } else if !scan
                 .entries
                 .iter()
                 .any(|e| e.rel.is_within(rel) && e.store.is_some())
@@ -492,6 +523,18 @@ impl Ctx {
     }
 }
 
+/// The ignore rules for a store: built in, the manifest's, `skip`, and
+/// cubby's own files.
+fn ignore_rules(cfg: &Config, manifest: &Manifest, skip: &[String]) -> Result<Ignore> {
+    let mut ignore = Ignore::new(&manifest.ignore, skip)?;
+    for (path, why) in cfg.own_paths() {
+        if let Ok(rel) = Rel::from_path_under(&cfg.layout.home, &path) {
+            ignore.reserve(rel, why);
+        }
+    }
+    Ok(ignore)
+}
+
 /// A command whose name is a likely typo of `word` (`statu` → `status`).
 /// Bare paths mean "save", so a mistyped command shows up as a missing file.
 pub fn similar_command(word: &str) -> Option<String> {
@@ -575,6 +618,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Some(Command::Untrack { paths }) => {
             let mut ctx = Ctx::load(&global)?;
             untrack::run(&mut ctx, &paths)
+        }
+        Some(Command::Ignore {
+            patterns,
+            here,
+            remove,
+        }) => {
+            let mut ctx = Ctx::load(&global)?;
+            ignore::run(&mut ctx, &patterns, here, remove)
         }
         Some(Command::History { count, all, op }) => {
             let ctx = Ctx::load(&global)?;

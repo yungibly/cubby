@@ -276,6 +276,31 @@ impl Manifest {
         true
     }
 
+    /// Add an ignore pattern at the end of the list. Returns false when it
+    /// is already there.
+    pub fn add_ignore(&mut self, pattern: &str) -> bool {
+        if self.ignore.iter().any(|p| p == pattern) {
+            return false;
+        }
+        self.ignore.push(pattern.to_owned());
+        let array = tomlx::array_mut(&mut self.doc, "ignore").expect("ignore is a list");
+        let end = array.len();
+        tomlx::insert_str(array, end, pattern);
+        true
+    }
+
+    /// Remove an ignore pattern. Returns false when it was not there.
+    pub fn remove_ignore(&mut self, pattern: &str) -> bool {
+        let before = self.ignore.len();
+        self.ignore.retain(|p| p != pattern);
+        if before == self.ignore.len() {
+            return false;
+        }
+        let array = tomlx::array_mut(&mut self.doc, "ignore").expect("ignore is a list");
+        tomlx::remove_where(array, |v| v.as_str() == Some(pattern));
+        true
+    }
+
     pub fn remove_dir(&mut self, rel: &Rel) -> bool {
         let before = self.dirs.len();
         self.dirs.retain(|d| d != rel);
@@ -333,6 +358,7 @@ mod tests {
         let mut m = Manifest::fresh();
         for n in names {
             m.add_dir(rel(&format!(".config/{n}")));
+            m.add_ignore(n);
         }
         let parsed = Manifest::parse(&m.render()).unwrap();
         assert_eq!(parsed, m);
@@ -345,15 +371,20 @@ mod tests {
                     ignore = [\n  # plugin manager lock file\n  \"lazy-lock.json\",\n]\n";
         let mut m = Manifest::parse(text).unwrap();
         m.add_dir(rel(".config/fish"));
+        m.add_ignore("*.bak");
+        assert!(!m.add_ignore("*.bak"));
         m.remove_dir(&rel(".config/nvim"));
         let out = m.render();
         assert_eq!(
             out,
             "# my dotfiles\nversion = 2\n\n\
              dirs = [\n  \"~/.config/fish\",\n]\n\n\
-             ignore = [\n  # plugin manager lock file\n  \"lazy-lock.json\",\n]\n"
+             ignore = [\n  # plugin manager lock file\n  \"lazy-lock.json\",\n  \"*.bak\",\n]\n"
         );
         assert_eq!(Manifest::parse(&out).unwrap(), m);
+        assert!(m.remove_ignore("lazy-lock.json"));
+        assert!(!m.remove_ignore("lazy-lock.json"));
+        assert!(!m.render().contains("plugin manager"));
     }
 
     #[test]

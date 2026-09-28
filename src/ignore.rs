@@ -35,8 +35,9 @@ pub struct Ignore {
 }
 
 impl Ignore {
-    /// Build from the manifest's patterns.
-    pub fn new(patterns: &[String]) -> Result<Ignore> {
+    /// Build from the manifest's patterns and, for everything this machine
+    /// skips, the config file's `skip` patterns.
+    pub fn new(patterns: &[String], skip: &[String]) -> Result<Ignore> {
         let mut names = GlobSetBuilder::new();
         let mut paths = GlobSetBuilder::new();
         let mut name_reasons = Vec::new();
@@ -46,27 +47,27 @@ impl Ignore {
             names.add(glob(p)?);
             name_reasons.push(format!("{p} is never tracked"));
         }
-        for raw in patterns {
-            let p = raw.trim();
-            if p.is_empty() || p.starts_with('#') {
-                continue;
-            }
-            let stripped = p
-                .strip_prefix("~/")
-                .or_else(|| p.strip_prefix('/'))
-                .unwrap_or(p);
-            let stripped = stripped.strip_suffix('/').unwrap_or(stripped);
-            let reason = format!(
-                "pattern {} in {}",
-                crate::config::toml_string(raw),
-                crate::manifest::FILE_NAME
-            );
-            if stripped.contains('/') {
-                paths.add(glob(stripped)?);
-                path_reasons.push(reason);
-            } else {
-                names.add(glob(stripped)?);
-                name_reasons.push(reason);
+        for (list, skipped) in [(patterns, false), (skip, true)] {
+            for raw in list {
+                let Some((kind, glob)) = parse(raw)? else {
+                    continue;
+                };
+                let quoted = crate::config::toml_string(raw);
+                let reason = if skipped {
+                    format!("skipped on this machine (skip pattern {quoted} in config.toml)")
+                } else {
+                    format!("pattern {quoted} in {}", crate::manifest::FILE_NAME)
+                };
+                match kind {
+                    Kind::Path => {
+                        paths.add(glob);
+                        path_reasons.push(reason);
+                    }
+                    Kind::Name => {
+                        names.add(glob);
+                        name_reasons.push(reason);
+                    }
+                }
             }
         }
         let mut root = GlobSetBuilder::new();
@@ -119,6 +120,37 @@ impl Ignore {
     }
 }
 
+enum Kind {
+    /// Matches a name at any depth.
+    Name,
+    /// Matches a path relative to home.
+    Path,
+}
+
+/// What kind of pattern `raw` is, compiled; `None` for blank lines and
+/// comments.
+fn parse(raw: &str) -> Result<Option<(Kind, Glob)>> {
+    let p = raw.trim();
+    if p.is_empty() || p.starts_with('#') {
+        return Ok(None);
+    }
+    let stripped = p
+        .strip_prefix("~/")
+        .or_else(|| p.strip_prefix('/'))
+        .unwrap_or(p);
+    let stripped = stripped.strip_suffix('/').unwrap_or(stripped);
+    if stripped.contains('/') {
+        Ok(Some((Kind::Path, glob(stripped)?)))
+    } else {
+        Ok(Some((Kind::Name, glob(stripped)?)))
+    }
+}
+
+/// Check that `raw` is a pattern cubby can use.
+pub fn validate(raw: &str) -> Result<()> {
+    parse(raw).map(|_| ())
+}
+
 fn glob(pattern: &str) -> Result<Glob> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
@@ -134,8 +166,12 @@ mod tests {
         Rel::parse(s).unwrap()
     }
 
+    fn strings(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|s| s.to_string()).collect()
+    }
+
     fn ignore(patterns: &[&str]) -> Ignore {
-        Ignore::new(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        Ignore::new(&strings(patterns), &[]).unwrap()
     }
 
     #[test]
@@ -201,7 +237,21 @@ mod tests {
     }
 
     #[test]
+    fn skip_patterns_say_where_they_come_from() {
+        let ig = Ignore::new(&strings(&["*.swp"]), &strings(&["~/.config/aerospace"])).unwrap();
+        assert_eq!(
+            ig.reason(&rel(".config/aerospace/aerospace.toml"))
+                .as_deref(),
+            Some("skipped on this machine (skip pattern \"~/.config/aerospace\" in config.toml)")
+        );
+        assert!(ig.is_ignored(&rel("x.swp")));
+    }
+
+    #[test]
     fn invalid_pattern_is_an_error() {
-        assert!(Ignore::new(&["[".to_string()]).is_err());
+        assert!(Ignore::new(&strings(&["["]), &[]).is_err());
+        assert!(Ignore::new(&[], &strings(&["["])).is_err());
+        assert!(validate("[").is_err());
+        assert!(validate("*.swp").is_ok());
     }
 }

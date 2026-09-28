@@ -442,21 +442,28 @@ fn plan_chmods(plan: &mut Plan, scan: &Scan) {
 
 /// Plan removing every file of `scan` from the store.
 pub fn untrack_plan(scan: &Scan) -> Plan {
+    removal_plan(
+        scan.entries
+            .iter()
+            .filter_map(|e| Some((e.rel.clone(), e.store.as_ref()?.path.clone()))),
+    )
+}
+
+/// Plan removing these store files, given as a path and where it is.
+pub fn removal_plan(files: impl IntoIterator<Item = (Rel, PathBuf)>) -> Plan {
     let mut plan = Plan::new(RunKind::Untrack);
-    for e in &scan.entries {
-        if let Some(m) = &e.store {
-            plan.actions.push(Action {
-                rel: e.rel.clone(),
-                op: Op::Remove,
-                side: Side::Store,
-                note: String::new(),
-                src: None,
-                dst: m.path.clone(),
-                len: 0,
-                perms: Perms::default(),
-                mode: None,
-            });
-        }
+    for (rel, dst) in files {
+        plan.actions.push(Action {
+            rel,
+            op: Op::Remove,
+            side: Side::Store,
+            note: String::new(),
+            src: None,
+            dst,
+            len: 0,
+            perms: Perms::default(),
+            mode: None,
+        });
     }
     plan
 }

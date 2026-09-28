@@ -29,10 +29,9 @@ pub fn run(ctx: &Ctx, paths: &[String], quiet: bool) -> Result<i32> {
         if scan.entries.iter().any(|e| e.rel.is_within(rel)) {
             found_any = true;
         } else {
-            println!(
-                "{}",
-                ui::row(style, &style.dim("?"), rel.as_str(), "nothing tracked here")
-            );
+            let why = ctx.ignore.reason(rel);
+            let note = why.as_deref().unwrap_or("nothing tracked here");
+            println!("{}", ui::row(style, &style.dim("?"), rel.as_str(), note));
         }
     }
     if !found_any {

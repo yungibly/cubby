@@ -24,6 +24,7 @@ pub const BACKUP_SETS_TO_KEEP: usize = 20;
 struct ConfigFile {
     store: Option<String>,
     backups: Option<bool>,
+    skip: Option<Vec<String>>,
 }
 
 /// Command-line overrides that take precedence over the config file.
@@ -45,6 +46,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Whether the store path came from the default rather than configuration.
     pub store_is_default: bool,
+    /// Patterns this machine leaves alone even though they are in the
+    /// store; same syntax as the manifest's ignore patterns.
+    pub skip: Vec<String>,
 }
 
 /// The directories cubby derives everything else from.
@@ -150,6 +154,7 @@ impl Config {
             config_path,
             state_dir: env.state_dir,
             store_is_default,
+            skip: file.skip.unwrap_or_default(),
         })
     }
 
@@ -179,7 +184,13 @@ impl Config {
              \n\
              # backups: keep copies of files cubby overwrites or removes, under\n\
              #          ~/.local/state/cubby/backups (the newest {keep} runs are kept).\n\
-             backups = true\n",
+             backups = true\n\
+             \n\
+             # skip: paths or patterns this machine leaves alone even though they\n\
+             #       are in the store; say, macOS-only settings on a Linux machine.\n\
+             #       Same syntax as ignore in the store's .cubby.toml.\n\
+             #       `cubby ignore --here PATTERN` adds to it.\n\
+             skip = []\n",
             store = toml_string(store),
             keep = BACKUP_SETS_TO_KEEP
         )
@@ -190,6 +201,29 @@ impl Config {
 /// not valid TOML).
 pub fn toml_string(s: &str) -> String {
     toml::Value::String(s.to_owned()).to_string()
+}
+
+/// Change the list at `key` in the config file at `path` with `edit`,
+/// keeping everything else in the file as it was. A missing file starts
+/// from the template, pointing at `store`.
+pub fn edit_list<R>(
+    path: &Path,
+    store: &str,
+    key: &str,
+    edit: impl FnOnce(&mut toml_edit::Array) -> R,
+) -> Result<R> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::template(store),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("invalid config file {}", path.display()))?;
+    let result = edit(crate::tomlx::array_mut(&mut doc, key)?);
+    crate::fsx::write_atomic(path, doc.to_string().as_bytes())
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(result)
 }
 
 fn read_config_file(path: &Path) -> Result<ConfigFile> {
@@ -212,6 +246,7 @@ mod tests {
         let file: ConfigFile = toml::from_str(&text).unwrap();
         assert_eq!(file.store.as_deref(), Some("~/.dotfiles"));
         assert_eq!(file.backups, Some(true));
+        assert_eq!(file.skip, Some(vec![]));
     }
 
     #[test]
