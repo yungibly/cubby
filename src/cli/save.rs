@@ -25,6 +25,11 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
         }
         let live = fsx::lstat(&ctx.cfg.layout.live(&rel))?;
         let stored = fsx::lstat(&ctx.cfg.layout.stored(&rel))?;
+        if let Some(m) = &live
+            && m.points_to_dir
+        {
+            warn_link_to_dir(ctx, &rel, m);
+        }
         match live.map(|m| m.kind) {
             Some(Kind::Dir) => match ctx.manifest.add_dir(rel.clone()) {
                 AddDir::Added { absorbed } => {
@@ -137,4 +142,28 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     }
     let code = ctx.run_plan(&plan)?;
     Ok(if failures > 0 { 1 } else { code })
+}
+
+/// Links are copied as links, which is rarely what someone naming a
+/// directory wants; say so and point at the real directory.
+fn warn_link_to_dir(ctx: &Ctx, rel: &crate::paths::Rel, meta: &fsx::Meta) {
+    let target = meta
+        .target
+        .as_ref()
+        .map(|t| t.display().to_string())
+        .unwrap_or_default();
+    let real = std::fs::canonicalize(&meta.path).ok();
+    let hint = match real
+        .as_ref()
+        .map(|r| (r, r.strip_prefix(&ctx.cfg.layout.home)))
+    {
+        Some((r, Ok(_))) if !r.starts_with(&ctx.cfg.layout.store) => format!(
+            "to copy the directory's contents, track it where it really is: `cubby {}`",
+            ctx.cfg.layout.pretty(r)
+        ),
+        _ => "cubby only copies directories inside your home directory".to_owned(),
+    };
+    ctx.warn(&format!(
+        "{rel} is a symlink to a directory ({target}); cubby saves the link itself, not the files in it. {hint}"
+    ));
 }

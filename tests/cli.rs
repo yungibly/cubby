@@ -471,6 +471,31 @@ fn symlinks_are_copied_as_symlinks() {
 }
 
 #[test]
+fn naming_a_symlinked_directory_explains_what_is_saved() {
+    let sb = Sandbox::ready();
+    sb.write_home("src/nvim-config/init.lua", "vim.o.number = true\n");
+    fs::create_dir_all(sb.home_path(".config")).unwrap();
+    std::os::unix::fs::symlink("../src/nvim-config", sb.home_path(".config/nvim")).unwrap();
+
+    let text = sb.ok(&["~/.config/nvim", "-y"]);
+    assert!(
+        text.contains("~/.config/nvim is a symlink to a directory (../src/nvim-config)"),
+        "{text}"
+    );
+    assert!(text.contains("`cubby ~/src/nvim-config`"), "{text}");
+    assert!(
+        text.contains("link → ../src/nvim-config (a directory; the link is saved"),
+        "{text}"
+    );
+    assert!(
+        fs::symlink_metadata(sb.store_path(".config/nvim"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn conflicts_are_skipped_unless_forced() {
     let sb = Sandbox::ready();
     sb.write_home(".zshrc", "file\n");

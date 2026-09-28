@@ -43,6 +43,9 @@ pub struct Meta {
     pub ino: u64,
     /// The link target, for symlinks.
     pub target: Option<PathBuf>,
+    /// For symlinks: whether the target, followed from where the link is,
+    /// is a directory.
+    pub points_to_dir: bool,
 }
 
 impl Meta {
@@ -81,6 +84,7 @@ pub fn lstat(path: &Path) -> Result<Option<Meta>> {
     } else {
         None
     };
+    let points_to_dir = kind == Kind::Symlink && fs::metadata(path).is_ok_and(|m| m.is_dir());
     Ok(Some(Meta {
         path: path.to_path_buf(),
         kind,
@@ -90,6 +94,7 @@ pub fn lstat(path: &Path) -> Result<Option<Meta>> {
         dev: md.dev(),
         ino: md.ino(),
         target,
+        points_to_dir,
     }))
 }
 

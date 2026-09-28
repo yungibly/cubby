@@ -114,11 +114,25 @@ pub fn plan(scan: &Scan, layout: &Layout, direction: Direction, force: bool) -> 
             .as_ref()
             .map(|m| m.path.clone())
             .unwrap_or_else(|| layout.stored(&e.rel));
-        let copy = |op: Op, note: String| {
+        let copy = |op: Op, mut note: String| {
             let (src, dst) = match direction {
                 Direction::Save => (home_path.clone(), store_path.clone()),
                 Direction::Restore => (store_path.clone(), home_path.clone()),
             };
+            let src_meta = match direction {
+                Direction::Save => e.home.as_ref(),
+                Direction::Restore => e.store.as_ref(),
+            };
+            if let Some(m) = src_meta
+                && let Some(target) = &m.target
+            {
+                note.push_str(&format!(", link → {}", target.display()));
+                // A relative target only means something where the link
+                // lives, so this is only known for links at home.
+                if direction == Direction::Save && m.points_to_dir {
+                    note.push_str(" (a directory; the link is saved, not its contents)");
+                }
+            }
             Action {
                 rel: e.rel.clone(),
                 op,
