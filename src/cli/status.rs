@@ -246,6 +246,12 @@ pub fn run(ctx: &mut Ctx, paths: &[String], quiet: bool) -> Result<i32> {
         if !hints.is_empty() {
             println!("{}", style.dim(&hints.join(", ")));
         }
+        if hints.len() == 2 {
+            println!(
+                "{}",
+                style.dim("`cubby sync` does both, each path in the direction it changed")
+            );
+        }
         if both_sides {
             println!(
                 "{}",

@@ -45,6 +45,7 @@ impl Direction {
 pub enum RunKind {
     Save,
     Restore,
+    Sync,
     Untrack,
 }
 
@@ -53,6 +54,7 @@ impl RunKind {
         match self {
             RunKind::Save => "save",
             RunKind::Restore => "restore",
+            RunKind::Sync => "sync",
             RunKind::Untrack => "untrack",
         }
     }
@@ -62,6 +64,7 @@ impl RunKind {
         match self {
             RunKind::Save => "saved",
             RunKind::Restore => "restored",
+            RunKind::Sync => "synced",
             RunKind::Untrack => "removed",
         }
     }
@@ -221,151 +224,211 @@ pub fn plan(
     };
     let mut plan = Plan::new(kind);
     for e in &scan.entries {
-        let skip = |why: Skip| Skipped {
-            rel: e.rel.clone(),
-            why,
-        };
-        // Real on-disk paths where they exist, the mirrored path otherwise.
-        let home_path = e
-            .home
-            .as_ref()
-            .map(|m| m.path.clone())
-            .unwrap_or_else(|| layout.live(&e.rel));
-        let store_path = e
-            .store
-            .as_ref()
-            .map(|m| m.path.clone())
-            .unwrap_or_else(|| layout.stored(&e.rel));
-        let copy = |op: Op, mut note: String| {
-            let (src, src_meta, dst) = match direction {
-                Direction::Save => (home_path.clone(), e.home.as_ref(), store_path.clone()),
-                Direction::Restore => (store_path.clone(), e.store.as_ref(), home_path.clone()),
-            };
-            if let Some(m) = src_meta
-                && let Some(target) = &m.target
-            {
-                note.push_str(&format!(", link → {}", target.display()));
-                // A relative target only means something where the link
-                // lives, so this is only known for links at home.
-                if direction == Direction::Save && m.points_to_dir {
-                    note.push_str(" (a directory; the link is saved, not its contents)");
-                }
-            }
-            Action {
-                rel: e.rel.clone(),
-                op,
-                side: direction.writes(),
-                note,
-                src: Some(src),
-                dst,
-                len: src_meta.map_or(0, |m| m.len),
-                perms: copy_perms(e, scan, layout, modes, direction),
-                mode: None,
-            }
-        };
-        let remove = |note: &str| Action {
-            rel: e.rel.clone(),
-            op: Op::Remove,
-            side: Side::Store,
-            note: note.to_owned(),
-            src: None,
-            dst: store_path.clone(),
-            len: 0,
-            perms: Perms::default(),
-            mode: None,
-        };
-        // The side this run would copy over, when that side changed.
-        let there = match direction {
-            Direction::Save => (Change::Store, "changed in the store"),
-            Direction::Restore => (Change::Home, "changed at home"),
-        };
-        match (&e.state, direction) {
-            (State::Same, _) => {}
-            (State::Modified(Change::Both), _) if !force => plan.skipped.push(skip(
-                Skip::Conflict("changed at home and in the store".into()),
-            )),
-            (State::Modified(change), _) if *change == there.0 && !force => plan
-                .skipped
-                .push(skip(Skip::ChangedThere(direction.writes()))),
-            (State::Modified(change), _) => {
-                let note = match change {
-                    Change::Home => "changed at home".to_owned(),
-                    Change::Store => "changed in the store".to_owned(),
-                    Change::Unknown => "modified".to_owned(),
-                    Change::Both => "changed at home and in the store".to_owned(),
-                };
-                let note = if *change == there.0 || *change == Change::Both {
-                    format!("{note}; replacing that copy")
-                } else {
-                    note
-                };
-                plan.actions.push(copy(Op::Overwrite, note));
-            }
-            (State::New { was_stored: false }, Direction::Save) => {
-                plan.actions.push(copy(Op::Create, "new".into()))
-            }
-            (State::New { was_stored: true }, Direction::Save) if force => plan.actions.push(copy(
-                Op::Create,
-                "deleted from the store since the last sync; adding it back".into(),
-            )),
-            (State::New { was_stored: true }, Direction::Save) => {
-                plan.skipped.push(skip(Skip::DeletedFromStore))
-            }
-            (State::New { .. }, Direction::Restore) => plan.skipped.push(skip(Skip::NewAtHome)),
-            (
-                State::Missing {
-                    was_here: true,
-                    under_present_dir: true,
-                    store_changed,
-                },
-                Direction::Save,
-            ) => match (store_changed, force) {
-                (false, _) => plan.actions.push(remove("deleted at home")),
-                (true, true) => plan
-                    .actions
-                    .push(remove("deleted at home; removing the store's newer copy")),
-                (true, false) => plan.skipped.push(skip(Skip::Conflict(
-                    "deleted at home, changed in the store".into(),
-                ))),
-            },
-            (State::Missing { was_here, .. }, Direction::Save) => {
-                plan.skipped.push(skip(Skip::MissingAtHome {
-                    was_here: *was_here,
-                }))
-            }
-            (State::Missing { was_here, .. }, Direction::Restore) => {
-                let note = if *was_here {
-                    "deleted at home"
-                } else {
-                    "new in the store"
-                };
-                plan.actions.push(copy(Op::Create, note.into()))
-            }
-            (State::Conflict { home, store }, dir) => {
-                let text = format!(
-                    "home has {}, store has {}",
-                    home.describe(),
-                    store.describe()
-                );
-                let replaceable = !matches!(home, Kind::Dir) && !matches!(store, Kind::Dir);
-                if force && replaceable {
-                    let note = match dir {
-                        Direction::Save => format!("{text}; replacing the store copy"),
-                        Direction::Restore => format!("{text}; replacing the home copy"),
-                    };
-                    plan.actions.push(copy(Op::Overwrite, note));
-                } else {
-                    plan.skipped.push(skip(Skip::Conflict(text)));
-                }
-            }
-            (State::Error(msg), _) => plan.skipped.push(skip(Skip::Error(msg.clone()))),
-        }
+        plan_entry(&mut plan, e, scan, layout, modes, direction, force);
     }
     match direction {
         Direction::Save => plan_records(&mut plan, scan, modes, force),
         Direction::Restore => plan_chmods(&mut plan, scan),
     }
     plan
+}
+
+/// Plan a sync: each path is copied the way it changed since the last
+/// sync. Paths changed on both sides, and paths that differ with no record
+/// of the last sync, are left for the person to decide.
+pub fn sync_plan(scan: &Scan, layout: &Layout, modes: &BTreeMap<Rel, u32>) -> Plan {
+    let mut plan = Plan::new(RunKind::Sync);
+    for e in &scan.entries {
+        let skip = |why: Skip| Skipped {
+            rel: e.rel.clone(),
+            why,
+        };
+        let direction = match &e.state {
+            State::Same => continue,
+            State::Modified(Change::Home) => Direction::Save,
+            State::Modified(Change::Store) => Direction::Restore,
+            State::Modified(Change::Unknown) => {
+                plan.skipped.push(skip(Skip::Conflict(
+                    "differs, with no record of the last sync".into(),
+                )));
+                continue;
+            }
+            State::New { .. } if e.dir.is_none() => continue,
+            State::New { .. } => Direction::Save,
+            State::Missing {
+                was_here: false, ..
+            } => Direction::Restore,
+            State::Missing {
+                under_present_dir: true,
+                ..
+            } => Direction::Save,
+            State::Missing { .. } => {
+                plan.skipped
+                    .push(skip(Skip::MissingAtHome { was_here: true }));
+                continue;
+            }
+            // Both sides changed, conflicts of kind, and errors are skipped
+            // the same way in either direction.
+            State::Modified(Change::Both) | State::Conflict { .. } | State::Error(_) => {
+                Direction::Save
+            }
+        };
+        plan_entry(&mut plan, e, scan, layout, modes, direction, false);
+    }
+    plan_records(&mut plan, scan, modes, false);
+    plan_chmods(&mut plan, scan);
+    plan
+}
+
+/// Plan what copying one path in `direction` takes, or why it is skipped.
+fn plan_entry(
+    plan: &mut Plan,
+    e: &Entry,
+    scan: &Scan,
+    layout: &Layout,
+    modes: &BTreeMap<Rel, u32>,
+    direction: Direction,
+    force: bool,
+) {
+    let skip = |why: Skip| Skipped {
+        rel: e.rel.clone(),
+        why,
+    };
+    // Real on-disk paths where they exist, the mirrored path otherwise.
+    let home_path = e
+        .home
+        .as_ref()
+        .map(|m| m.path.clone())
+        .unwrap_or_else(|| layout.live(&e.rel));
+    let store_path = e
+        .store
+        .as_ref()
+        .map(|m| m.path.clone())
+        .unwrap_or_else(|| layout.stored(&e.rel));
+    let copy = |op: Op, mut note: String| {
+        let (src, src_meta, dst) = match direction {
+            Direction::Save => (home_path.clone(), e.home.as_ref(), store_path.clone()),
+            Direction::Restore => (store_path.clone(), e.store.as_ref(), home_path.clone()),
+        };
+        if let Some(m) = src_meta
+            && let Some(target) = &m.target
+        {
+            note.push_str(&format!(", link → {}", target.display()));
+            // A relative target only means something where the link
+            // lives, so this is only known for links at home.
+            if direction == Direction::Save && m.points_to_dir {
+                note.push_str(" (a directory; the link is saved, not its contents)");
+            }
+        }
+        Action {
+            rel: e.rel.clone(),
+            op,
+            side: direction.writes(),
+            note,
+            src: Some(src),
+            dst,
+            len: src_meta.map_or(0, |m| m.len),
+            perms: copy_perms(e, scan, layout, modes, direction),
+            mode: None,
+        }
+    };
+    let remove = |note: &str| Action {
+        rel: e.rel.clone(),
+        op: Op::Remove,
+        side: Side::Store,
+        note: note.to_owned(),
+        src: None,
+        dst: store_path.clone(),
+        len: 0,
+        perms: Perms::default(),
+        mode: None,
+    };
+    // The side this run would copy over, when that side changed.
+    let there = match direction {
+        Direction::Save => (Change::Store, "changed in the store"),
+        Direction::Restore => (Change::Home, "changed at home"),
+    };
+    match (&e.state, direction) {
+        (State::Same, _) => {}
+        (State::Modified(Change::Both), _) if !force => plan.skipped.push(skip(Skip::Conflict(
+            "changed at home and in the store".into(),
+        ))),
+        (State::Modified(change), _) if *change == there.0 && !force => plan
+            .skipped
+            .push(skip(Skip::ChangedThere(direction.writes()))),
+        (State::Modified(change), _) => {
+            let note = match change {
+                Change::Home => "changed at home".to_owned(),
+                Change::Store => "changed in the store".to_owned(),
+                Change::Unknown => "modified".to_owned(),
+                Change::Both => "changed at home and in the store".to_owned(),
+            };
+            let note = if *change == there.0 || *change == Change::Both {
+                format!("{note}; replacing that copy")
+            } else {
+                note
+            };
+            plan.actions.push(copy(Op::Overwrite, note));
+        }
+        (State::New { was_stored: false }, Direction::Save) => {
+            plan.actions.push(copy(Op::Create, "new".into()))
+        }
+        (State::New { was_stored: true }, Direction::Save) if force => plan.actions.push(copy(
+            Op::Create,
+            "deleted from the store since the last sync; adding it back".into(),
+        )),
+        (State::New { was_stored: true }, Direction::Save) => {
+            plan.skipped.push(skip(Skip::DeletedFromStore))
+        }
+        (State::New { .. }, Direction::Restore) => plan.skipped.push(skip(Skip::NewAtHome)),
+        (
+            State::Missing {
+                was_here: true,
+                under_present_dir: true,
+                store_changed,
+            },
+            Direction::Save,
+        ) => match (store_changed, force) {
+            (false, _) => plan.actions.push(remove("deleted at home")),
+            (true, true) => plan
+                .actions
+                .push(remove("deleted at home; removing the store's newer copy")),
+            (true, false) => plan.skipped.push(skip(Skip::Conflict(
+                "deleted at home, changed in the store".into(),
+            ))),
+        },
+        (State::Missing { was_here, .. }, Direction::Save) => {
+            plan.skipped.push(skip(Skip::MissingAtHome {
+                was_here: *was_here,
+            }))
+        }
+        (State::Missing { was_here, .. }, Direction::Restore) => {
+            let note = if *was_here {
+                "deleted at home"
+            } else {
+                "new in the store"
+            };
+            plan.actions.push(copy(Op::Create, note.into()))
+        }
+        (State::Conflict { home, store }, dir) => {
+            let text = format!(
+                "home has {}, store has {}",
+                home.describe(),
+                store.describe()
+            );
+            let replaceable = !matches!(home, Kind::Dir) && !matches!(store, Kind::Dir);
+            if force && replaceable {
+                let note = match dir {
+                    Direction::Save => format!("{text}; replacing the store copy"),
+                    Direction::Restore => format!("{text}; replacing the home copy"),
+                };
+                plan.actions.push(copy(Op::Overwrite, note));
+            } else {
+                plan.skipped.push(skip(Skip::Conflict(text)));
+            }
+        }
+        (State::Error(msg), _) => plan.skipped.push(skip(Skip::Error(msg.clone()))),
+    }
 }
 
 /// How a copy of `e` treats permissions. Saving keeps a private file (and
@@ -429,7 +492,7 @@ fn plan_records(plan: &mut Plan, scan: &Scan, modes: &BTreeMap<Rel, u32>, force:
             perms::after_save(p.home, p.recorded, force),
         );
     }
-    for a in &plan.actions {
+    for a in plan.actions.iter().filter(|a| a.side == Side::Store) {
         let from = modes.get(&a.rel).copied();
         if a.op == Op::Remove {
             add(&a.rel, false, from, None);
@@ -451,7 +514,7 @@ fn plan_records(plan: &mut Plan, scan: &Scan, modes: &BTreeMap<Rel, u32>, force:
             }
         }
     }
-    for a in &mut plan.actions {
+    for a in plan.actions.iter_mut().filter(|a| a.side == Side::Store) {
         if a.op != Op::Remove
             && let Some(r) = records.get(&a.rel)
         {
@@ -469,7 +532,12 @@ fn plan_records(plan: &mut Plan, scan: &Scan, modes: &BTreeMap<Rel, u32>, force:
 /// Permission changes a restore makes at home: whatever is looser than the
 /// manifest records, unless a copy of that file already takes care of it.
 fn plan_chmods(plan: &mut Plan, scan: &Scan) {
-    let copied: Vec<Rel> = plan.actions.iter().map(|a| a.rel.clone()).collect();
+    let copied: Vec<Rel> = plan
+        .actions
+        .iter()
+        .filter(|a| a.side == Side::Home)
+        .map(|a| a.rel.clone())
+        .collect();
     for p in scan.perms.iter().filter(|p| p.needs_chmod()) {
         if !p.is_dir && copied.contains(&p.rel) {
             continue;

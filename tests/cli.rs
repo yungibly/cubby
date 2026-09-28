@@ -1022,6 +1022,60 @@ fn the_last_sync_decides_which_side_changed() {
 }
 
 #[test]
+fn sync_copies_each_change_the_way_it_went() {
+    let sb = Sandbox::ready();
+    sb.write_home(".zshrc", "one\n");
+    sb.write_home(".vimrc", "set nu\n");
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.write_home(".config/app/gone.conf", "g\n");
+    sb.ok(&["~/.zshrc", "~/.vimrc", "~/.config/app", "-y"]);
+
+    sb.write_store(".zshrc", "two\n");
+    sb.write_store(".config/app/b.conf", "b\n");
+    sb.write_home(".vimrc", "set nonu\n");
+    sb.write_home(".config/app/c.conf", "c\n");
+    fs::remove_file(sb.home_path(".config/app/gone.conf")).unwrap();
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("`cubby sync` does both"), "{text}");
+
+    let text = sb.ok(&["sync", "-n"]);
+    assert!(
+        text.contains("home → store") && text.contains("store → home"),
+        "{text}"
+    );
+    assert_eq!(sb.read_home(".zshrc"), "one\n");
+    let text = sb.ok(&["sync", "-y"]);
+    assert!(text.contains("synced 5 changes"), "{text}");
+    assert_eq!(sb.read_home(".zshrc"), "two\n");
+    assert_eq!(sb.read_home(".config/app/b.conf"), "b\n");
+    assert_eq!(sb.read_store(".vimrc"), "set nonu\n");
+    assert_eq!(sb.read_store(".config/app/c.conf"), "c\n");
+    assert!(!sb.store_path(".config/app/gone.conf").exists());
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(0));
+    let text = sb.ok(&["sync", "-y"]);
+    assert!(text.contains("nothing to sync"), "{text}");
+
+    // Changed on both sides, or different with no record of the last sync:
+    // left for the person to decide.
+    sb.write_home(".zshrc", "home\n");
+    sb.write_store(".zshrc", "store\n");
+    sb.write_store(".unknown", "s\n");
+    sb.write_home(".unknown", "h\n");
+    let text = sb.fail(&["sync", "-y"]);
+    assert!(
+        text.contains("! .zshrc") && text.contains("changed at home and in the store"),
+        "{text}"
+    );
+    assert!(
+        text.contains("! .unknown") && text.contains("no record of the last sync"),
+        "{text}"
+    );
+    assert!(text.contains("2 paths left for you"), "{text}");
+    assert_eq!(sb.read_home(".zshrc"), "home\n");
+    assert_eq!(sb.read_store(".zshrc"), "store\n");
+}
+
+#[test]
 fn a_new_machine_never_mistakes_store_files_for_deletions() {
     let sb = Sandbox::ready();
     // A store cloned from another machine, tracking ~/.config/app...

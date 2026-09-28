@@ -8,6 +8,7 @@ mod list;
 mod restore;
 mod save;
 mod status;
+mod sync;
 mod untrack;
 
 use std::path::PathBuf;
@@ -117,6 +118,15 @@ enum Command {
         /// Replace files whose kind differs between home and store
         #[arg(long)]
         force: bool,
+    },
+    /// Save what changed at home and restore what changed in the store
+    ///
+    /// Each path is copied the way it changed since the last sync. Paths
+    /// changed on both sides are left for you to decide; nothing at home is
+    /// ever deleted.
+    Sync {
+        #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
+        paths: Vec<String>,
     },
     /// Show what differs between home and the store
     Status {
@@ -476,6 +486,7 @@ impl Ctx {
         let mut deleted_here = 0;
         let mut new = 0;
         let mut kept = Vec::new();
+        let mut conflicts = 0;
         for s in &plan.skipped {
             let row = |symbol: &str, note: &str| {
                 println!("{}", ui::row(&self.style, symbol, s.rel.as_str(), note))
@@ -498,6 +509,10 @@ impl Ctx {
                         "deleted from the store; not added back",
                     );
                     kept.push(s);
+                }
+                Skip::Conflict(text) if plan.kind == RunKind::Sync => {
+                    row(&self.style.red("!"), text);
+                    conflicts += 1;
                 }
                 Skip::Conflict(text) => row(
                     &self.style.red("!"),
@@ -531,6 +546,12 @@ impl Ctx {
                 ui::plural(new, "file", "files"),
                 is_are(new),
                 it_them(new),
+            ));
+        }
+        if conflicts > 0 {
+            self.note(&format!(
+                "  {} left for you: `cubby diff PATH` shows both sides, `cubby save --force PATH` or `cubby restore --force PATH` picks one",
+                ui::plural(conflicts, "path", "paths")
             ));
         }
         if !kept.is_empty() {
@@ -696,6 +717,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Some(Command::Restore { paths, force }) => {
             let mut ctx = Ctx::load(&global)?;
             restore::run(&mut ctx, &paths, force)
+        }
+        Some(Command::Sync { paths }) => {
+            let mut ctx = Ctx::load(&global)?;
+            sync::run(&mut ctx, &paths)
         }
         Some(Command::Status { paths, quiet }) => {
             let mut ctx = Ctx::load(&global)?;
