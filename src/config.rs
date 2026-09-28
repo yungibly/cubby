@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::paths::{Layout, expand_tilde, normalize};
+use crate::paths::{Layout, expand_tilde, expand_tilde_path, normalize};
 
 pub const DEFAULT_STORE: &str = "~/.dotfiles";
 /// How many backup sets to keep before pruning the oldest.
@@ -89,7 +89,7 @@ fn xdg(var: &str, home: &Path, default: &str) -> PathBuf {
 
 /// Make a path absolute (against the current directory) and resolve symlinks
 /// when it exists.
-fn absolute(path: &Path) -> Result<PathBuf> {
+pub fn absolute(path: &Path) -> Result<PathBuf> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -109,20 +109,22 @@ impl Config {
         };
         let file = read_config_file(&config_path)?;
 
-        let (store, store_is_default) = if let Some(s) = &overrides.store {
-            (s.clone(), false)
+        // Where the store setting came from decides what a relative path is
+        // relative to: the current directory for the flag and the
+        // environment, like any path typed in a shell; home for the config
+        // file.
+        let (store, from_shell, store_is_default) = if let Some(s) = &overrides.store {
+            (expand_tilde_path(s, &env.home), true, false)
         } else if let Some(s) = std::env::var_os("CUBBY_STORE").filter(|s| !s.is_empty()) {
-            (PathBuf::from(s), false)
+            (expand_tilde_path(Path::new(&s), &env.home), true, false)
         } else if let Some(s) = &file.store {
-            (expand_tilde(s, &env.home), false)
+            (expand_tilde(s, &env.home), false, false)
         } else {
-            (expand_tilde(DEFAULT_STORE, &env.home), true)
+            (expand_tilde(DEFAULT_STORE, &env.home), false, true)
         };
-        // A relative store in the config file is relative to home; on the
-        // command line it is relative to the current directory, like any path.
         let store = if store.is_absolute() {
             store
-        } else if overrides.store.is_some() || std::env::var_os("CUBBY_STORE").is_some() {
+        } else if from_shell {
             std::env::current_dir()?.join(store)
         } else {
             env.home.join(store)

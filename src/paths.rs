@@ -115,11 +115,7 @@ impl Layout {
     /// Show an absolute path the way a user would type it (`~/...` when it is
     /// inside home).
     pub fn pretty(&self, path: &Path) -> String {
-        match path.strip_prefix(&self.home) {
-            Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => path.display().to_string(),
-        }
+        pretty(path, &self.home)
     }
 
     /// Turn a user-supplied path into a [`Rel`].
@@ -187,6 +183,16 @@ impl Layout {
     }
 }
 
+/// Show `path` the way a user would type it: `~/...` when it is inside
+/// `home`.
+pub fn pretty(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// Canonical composition (NFC) of a name; a no-op for ASCII.
 fn nfc(s: &str) -> String {
     if s.is_ascii() {
@@ -204,6 +210,15 @@ pub fn expand_tilde(arg: &str, home: &Path) -> PathBuf {
         home.join(rest)
     } else {
         PathBuf::from(arg)
+    }
+}
+
+/// [`expand_tilde`] for a path that may not be valid UTF-8.
+pub fn expand_tilde_path(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
     }
 }
 

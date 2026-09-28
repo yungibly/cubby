@@ -46,7 +46,14 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
             }
             None if stored.is_some() => {}
             None => {
-                ctx.error(&format!("{rel} does not exist"));
+                let name = rel.components().last().unwrap_or_default();
+                let bare = paths.iter().any(|p| p == name);
+                match super::similar_command(name).filter(|_| bare) {
+                    Some(cmd) => ctx.error(&format!(
+                        "{rel} does not exist (did you mean `cubby {cmd}`?)"
+                    )),
+                    None => ctx.error(&format!("{rel} does not exist")),
+                }
                 failures += 1;
                 continue;
             }

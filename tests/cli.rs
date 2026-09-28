@@ -721,7 +721,45 @@ fn store_can_be_chosen_by_flag_and_env() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), ".zshrc\n");
 
     let text = sb.fail(&["--store", "~/nowhere", "status"]);
+    assert!(text.contains("store ~/nowhere"), "{text}");
     assert!(text.contains("does not exist"), "{text}");
+    // A quoted tilde is expanded like an unquoted one.
+    let text = sb.ok(&["--store", "~/alt-store", "list", "--plain"]);
+    assert_eq!(text, ".zshrc\n");
+}
+
+#[test]
+fn init_twice_with_a_symlinked_store() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.home_path("Dropbox/dots")).unwrap();
+    std::os::unix::fs::symlink("Dropbox/dots", sb.home_path(".dotfiles")).unwrap();
+    sb.ok(&["init"]);
+    let text = sb.ok(&["init"]);
+    assert!(text.contains("config already at"), "{text}");
+    let config = fs::read_to_string(sb.home.join(".config/cubby/config.toml")).unwrap();
+    assert!(config.contains("store = \"~/.dotfiles\""), "{config}");
+}
+
+#[test]
+fn relative_store_in_config_is_relative_to_home() {
+    let sb = Sandbox::new();
+    write(
+        &sb.home.join(".config/cubby/config.toml"),
+        "store = \"dots\"\n",
+    );
+    sb.write_home("dots/.zshrc", "z\n");
+    fs::create_dir_all(sb.home_path("elsewhere")).unwrap();
+    // Even with CUBBY_STORE set but empty, and run from another directory.
+    let out = Command::new(env!("CARGO_BIN_EXE_cubby"))
+        .args(["list", "--plain"])
+        .env("CUBBY_HOME", &sb.home)
+        .env("CUBBY_STORE", "")
+        .env("NO_COLOR", "1")
+        .current_dir(sb.home_path("elsewhere"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), ".zshrc\n");
 }
 
 #[test]
@@ -735,6 +773,29 @@ fn large_previews_are_capped() {
     let text = sb.ok(&["~/.config/many", "-n", "-v"]);
     assert!(text.contains("file44"), "{text}");
     assert!(!text.contains("more"), "{text}");
+}
+
+#[test]
+fn global_flags_work_before_the_command() {
+    let sb = Sandbox::ready();
+    sb.write_store(".zshrc", "store\n");
+    sb.write_home(".zshrc", "home\n");
+    let text = sb.ok(&["-n", "restore"]);
+    assert!(text.contains("dry run"), "{text}");
+    assert_eq!(sb.read_home(".zshrc"), "home\n");
+    let text = sb.ok(&["-v", "--color", "never", "status"]);
+    assert!(text.contains("~ .zshrc"), "{text}");
+    let text = sb.ok(&["--store", "~/.dotfiles", "list", "--plain"]);
+    assert_eq!(text, ".zshrc\n");
+
+    let text = sb.fail(&["~/.zshrc", "status"]);
+    assert!(text.contains("~/status does not exist"), "{text}");
+    let text = sb.fail(&["--force", "status"]);
+    assert!(text.contains("go after the command"), "{text}");
+    let text = sb.fail(&["statu"]);
+    assert!(text.contains("did you mean `cubby status`?"), "{text}");
+    let text = sb.fail(&["~/statu"]);
+    assert!(!text.contains("did you mean"), "{text}");
 }
 
 #[test]

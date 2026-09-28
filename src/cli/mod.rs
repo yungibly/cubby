@@ -45,7 +45,6 @@ first.";
     version,
     about = "Keep copies of your dotfiles in a store that mirrors your home directory",
     long_about = LONG_ABOUT,
-    args_conflicts_with_subcommands = true,
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -411,6 +410,36 @@ impl Ctx {
     }
 }
 
+/// A command whose name is a likely typo of `word` (`statu` → `status`).
+/// Bare paths mean "save", so a mistyped command shows up as a missing file.
+pub fn similar_command(word: &str) -> Option<String> {
+    if word.contains('/') || word.starts_with(['.', '~']) {
+        return None;
+    }
+    Cli::command()
+        .get_subcommands()
+        .filter(|c| !c.is_hide_set())
+        .flat_map(|c| std::iter::once(c.get_name()).chain(c.get_visible_aliases()))
+        .map(|name| (edit_distance(word, name), name.to_owned()))
+        .filter(|(d, name)| *d > 0 && *d <= 2 && *d < name.len())
+        .min()
+        .map(|(_, name)| name)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 /// Parse arguments, run, and return the process exit code.
 pub fn run() -> i32 {
     let cli = Cli::parse();
@@ -426,6 +455,11 @@ pub fn run() -> i32 {
 
 fn dispatch(cli: Cli) -> Result<i32> {
     let global = cli.global.clone();
+    // Global flags may come before a command (`cubby -n restore`); bare
+    // paths and --force may not, since they belong to the implied save.
+    if cli.command.is_some() && (!cli.paths.is_empty() || cli.force) {
+        bail!("paths and --force go after the command, as in `cubby save --force PATH`");
+    }
     match cli.command {
         None => {
             let mut ctx = Ctx::load(&global)?;
