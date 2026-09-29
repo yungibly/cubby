@@ -7,7 +7,7 @@ use crate::ui;
 
 /// Copy every change in the direction it was made: what changed at home is
 /// saved, what changed in the store is restored.
-pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
+pub fn run(ctx: &mut Ctx, paths: &[String], allow_secrets: bool) -> Result<i32> {
     ctx.require_store()?;
     ctx.require_lock()?;
     let Some((scope, mut failures)) = ctx.scope_for(paths) else {
@@ -16,8 +16,9 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
     let scan = ctx.scanner().scan(&scope)?;
     ctx.learn(&scan, &scope);
     failures += ctx.report_unstored(&scope, &scan);
-    let plan = plan::sync_plan(&scan, &ctx.cfg.layout, &ctx.manifest.modes);
+    let mut plan = plan::sync_plan(&scan, &ctx.cfg.layout, &ctx.manifest.modes);
     failures += plan.troubled();
+    let secrets = ctx.mark_secrets(&mut plan);
 
     for n in &scan.notes {
         ctx.warn(&format!("{}: {}", n.path, n.why));
@@ -45,6 +46,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         ctx.print_plan(&to_home);
     }
     ctx.print_skipped(&plan);
+    ctx.warn_secrets(&secrets);
 
     let saves = to_store.actions.len() + to_store.standalone_records().count();
     let restores = to_home.actions.len();
@@ -73,6 +75,10 @@ pub fn run(ctx: &mut Ctx, paths: &[String]) -> Result<i32> {
         ui::plural(saves + restores, "change", "changes")
     ))? {
         ctx.note("aborted");
+        return Ok(1);
+    }
+    failures += ctx.withhold_secrets(&mut plan, &secrets, allow_secrets)?;
+    if plan.is_empty() {
         return Ok(1);
     }
     // The run writes the manifest, and records these edits for undo.

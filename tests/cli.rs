@@ -783,7 +783,13 @@ fn private_permissions_survive_a_fresh_clone() {
     chmod(&a.home_path(".ssh/config"), 0o600);
     chmod(&a.home_path(".netrc"), 0o600);
     chmod(&a.home_path(".bin/tool"), 0o700);
-    let text = a.ok(&["~/.ssh/config", "~/.netrc", "~/.bin/tool", "-y"]);
+    let text = a.ok(&[
+        "~/.ssh/config",
+        "~/.netrc",
+        "~/.bin/tool",
+        "-y",
+        "--allow-secrets",
+    ]);
     assert!(text.contains("~ .ssh/ "), "{text}");
     assert!(text.contains("record permissions 700"), "{text}");
     let m = a.manifest();
@@ -848,6 +854,54 @@ fn private_permissions_survive_a_fresh_clone() {
     b.ok(&["untrack", "~/.ssh/config", "-y"]);
     let m = b.manifest();
     assert!(!m.contains(".ssh"), "{m}");
+}
+
+#[test]
+fn files_that_look_secret_need_a_second_yes() {
+    let sb = Sandbox::ready();
+    let token = |s: &str| format!("github.com:\n  oauth_token: ghp_{}\n", s.repeat(9));
+    sb.write_home(".config/gh/hosts.yml", &token("a1B2"));
+    sb.write_home(".config/gh/config.yml", "editor: vim\n");
+    sb.write_home(
+        ".ssh/work_key",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n",
+    );
+
+    // --yes alone does not answer this question.
+    let text = sb.fail(&["~/.config/gh", "~/.ssh/work_key", "-y"]);
+    assert!(
+        text.contains("looks secret: it holds what looks like a GitHub token"),
+        "{text}"
+    );
+    assert!(
+        text.contains("looks secret: it holds a private key"),
+        "{text}"
+    );
+    assert!(text.contains("2 files above look like secrets"), "{text}");
+    assert!(
+        text.contains("left out 2 files that look secret; `--allow-secrets` saves them"),
+        "{text}"
+    );
+    assert!(sb.store_path(".config/gh/config.yml").exists());
+    assert!(!sb.store_path(".config/gh/hosts.yml").exists());
+    assert!(!sb.store_path(".ssh/work_key").exists());
+
+    // Allowed, they go in, and later changes are not asked about again.
+    sb.ok(&["~/.ssh/work_key", "-y", "--allow-secrets"]);
+    sb.ok(&["sync", "-y", "--allow-secrets"]);
+    assert!(sb.store_path(".config/gh/hosts.yml").exists());
+    assert!(sb.store_path(".ssh/work_key").exists());
+    sb.write_home(".config/gh/hosts.yml", &token("c3D4"));
+    let text = sb.ok(&["-y"]);
+    assert!(!text.contains("looks secret"), "{text}");
+
+    // A new store ignores the usual names of private keys.
+    sb.write_home(".ssh/id_ed25519", "-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    let text = sb.fail(&["~/.ssh/id_ed25519", "-y"]);
+    assert!(
+        text.contains("is ignored: pattern \"id_ed25519\""),
+        "{text}"
+    );
 }
 
 #[test]

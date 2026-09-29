@@ -11,6 +11,7 @@ mod perms;
 mod plan;
 mod runs;
 mod scan;
+mod secrets;
 mod testutil;
 mod tomlx;
 mod ui;

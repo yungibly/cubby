@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
+    /// Save files that look like secrets without asking
+    #[arg(long)]
+    allow_secrets: bool,
+
     #[command(flatten)]
     global: Global,
 }
@@ -111,6 +115,9 @@ enum Command {
         /// Replace files whose kind differs between home and store
         #[arg(long)]
         force: bool,
+        /// Save files that look like secrets without asking
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Copy files from the store back into home (all tracked files, or the given paths)
     Restore {
@@ -128,6 +135,9 @@ enum Command {
     Sync {
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
+        /// Save files that look like secrets without asking
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Show what differs between home and the store
     Status {
@@ -579,6 +589,77 @@ impl Ctx {
         }
     }
 
+    /// Mark the files a plan would put in the store for the first time that
+    /// look like secrets, and return their paths.
+    pub fn mark_secrets(&self, plan: &mut Plan) -> Vec<Rel> {
+        let mut found = Vec::new();
+        for a in &mut plan.actions {
+            if a.side != Side::Store || a.op != Op::Create {
+                continue;
+            }
+            let meta = a
+                .src
+                .as_deref()
+                .and_then(|p| crate::fsx::lstat(p).ok().flatten());
+            if let Some(why) = meta.as_ref().and_then(crate::secrets::check) {
+                a.note.push_str(&format!("; looks secret: {why}"));
+                found.push(a.rel.clone());
+            }
+        }
+        found
+    }
+
+    /// Warn about files that look like secrets, before the plan's question.
+    pub fn warn_secrets(&self, secrets: &[Rel]) {
+        if !secrets.is_empty() {
+            self.warn(&format!(
+                "{} above {}; the store usually ends up in git, so check before pushing it anywhere public",
+                ui::plural(secrets.len(), "file", "files"),
+                if secrets.len() == 1 {
+                    "looks like a secret"
+                } else {
+                    "look like secrets"
+                }
+            ));
+        }
+    }
+
+    /// Ask separately about files that look like secrets: `--yes` alone
+    /// does not answer this, `--allow-secrets` does. Those not allowed are
+    /// taken out of the plan. Returns how many were.
+    pub fn withhold_secrets(&self, plan: &mut Plan, secrets: &[Rel], allow: bool) -> Result<usize> {
+        if secrets.is_empty() || allow {
+            return Ok(0);
+        }
+        let keep = !self.yes
+            && ui::confirm(
+                &format!(
+                    "save the {} too?",
+                    if secrets.len() == 1 {
+                        "file that looks like a secret".to_owned()
+                    } else {
+                        format!("{} files that look like secrets", secrets.len())
+                    }
+                ),
+                &self.estyle,
+            )?;
+        if keep {
+            return Ok(0);
+        }
+        plan.actions.retain(|a| !secrets.contains(&a.rel));
+        plan.records.retain(|r| !secrets.contains(&r.rel));
+        self.note(&format!(
+            "left out {}; `--allow-secrets` saves {}",
+            ui::plural(
+                secrets.len(),
+                "file that looks secret",
+                "files that look secret"
+            ),
+            if secrets.len() == 1 { "it" } else { "them" }
+        ));
+        Ok(secrets.len())
+    }
+
     /// The line for a plan with nothing to do: `done` when that is because
     /// everything is up to date, a pointer to the skipped paths otherwise.
     pub fn print_nothing_to_do(&self, plan: &Plan, done: &str) {
@@ -731,25 +812,32 @@ fn dispatch(cli: Cli) -> Result<i32> {
     let global = cli.global.clone();
     // Global flags may come before a command (`cubby -n restore`); bare
     // paths and --force may not, since they belong to the implied save.
-    if cli.command.is_some() && (!cli.paths.is_empty() || cli.force) {
+    if cli.command.is_some() && (!cli.paths.is_empty() || cli.force || cli.allow_secrets) {
         bail!("paths and --force go after the command, as in `cubby save --force PATH`");
     }
     match cli.command {
         None => {
             let mut ctx = Ctx::load(&global)?;
-            save::run(&mut ctx, &cli.paths, cli.force)
+            save::run(&mut ctx, &cli.paths, cli.force, cli.allow_secrets)
         }
-        Some(Command::Save { paths, force }) => {
+        Some(Command::Save {
+            paths,
+            force,
+            allow_secrets,
+        }) => {
             let mut ctx = Ctx::load(&global)?;
-            save::run(&mut ctx, &paths, force)
+            save::run(&mut ctx, &paths, force, allow_secrets)
         }
         Some(Command::Restore { paths, force }) => {
             let mut ctx = Ctx::load(&global)?;
             restore::run(&mut ctx, &paths, force)
         }
-        Some(Command::Sync { paths }) => {
+        Some(Command::Sync {
+            paths,
+            allow_secrets,
+        }) => {
             let mut ctx = Ctx::load(&global)?;
-            sync::run(&mut ctx, &paths)
+            sync::run(&mut ctx, &paths, allow_secrets)
         }
         Some(Command::Status { paths, quiet }) => {
             let mut ctx = Ctx::load(&global)?;

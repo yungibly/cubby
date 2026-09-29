@@ -27,8 +27,21 @@ pub const FILE_NAME: &str = ".cubby.toml";
 /// format of cubby 2.
 pub const VERSION: i64 = 2;
 
-/// Ignore patterns written into a fresh manifest.
-pub const DEFAULT_IGNORE: &[&str] = &["*.swp", "*~", "__pycache__", "node_modules"];
+/// Ignore patterns written into a fresh manifest: editor and build debris,
+/// and the usual names of SSH and GnuPG private keys.
+pub const DEFAULT_IGNORE: &[&str] = &[
+    "*.swp",
+    "*~",
+    "__pycache__",
+    "node_modules",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_ecdsa_sk",
+    "id_ed25519_sk",
+    "private-keys-v1.d",
+];
 
 #[derive(Debug, Clone)]
 pub struct Manifest {

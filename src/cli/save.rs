@@ -7,7 +7,7 @@ use crate::plan::{self, Direction, Op};
 use crate::scan::Scope;
 use crate::ui;
 
-pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
+pub fn run(ctx: &mut Ctx, paths: &[String], force: bool, allow_secrets: bool) -> Result<i32> {
     ctx.require_store()?;
     ctx.require_lock()?;
     let (rels, mut failures) = ctx.resolve_paths(paths);
@@ -77,7 +77,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
 
     let scan = ctx.scanner().scan(&scope)?;
     ctx.learn(&scan, &scope);
-    let plan = plan::plan(
+    let mut plan = plan::plan(
         &scan,
         &ctx.cfg.layout,
         &ctx.manifest.modes,
@@ -85,6 +85,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
         force,
     );
     failures += plan.troubled();
+    let secrets = ctx.mark_secrets(&mut plan);
 
     for n in &scan.notes {
         ctx.warn(&format!("{}: {}", n.path, n.why));
@@ -114,6 +115,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     println!("{} {}", ctx.style.bold("save →"), ctx.store_label());
     ctx.print_plan(&plan);
     ctx.print_skipped(&plan);
+    ctx.warn_secrets(&secrets);
 
     let copies = plan.count(Op::Create) + plan.count(Op::Overwrite);
     let removals = plan.count(Op::Remove);
@@ -153,6 +155,10 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
         )
     ))? {
         ctx.note("aborted");
+        return Ok(1);
+    }
+    failures += ctx.withhold_secrets(&mut plan, &secrets, allow_secrets)?;
+    if plan.is_empty() {
         return Ok(1);
     }
     // The run writes the manifest, and records these edits for undo.
