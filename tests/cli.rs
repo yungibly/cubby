@@ -39,15 +39,7 @@ impl Sandbox {
     }
 
     fn cmd(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_cubby"))
-            .args(args)
-            .env("CUBBY_HOME", &self.home)
-            .env_remove("CUBBY_STORE")
-            .env_remove("CUBBY_PAGER")
-            .env("PAGER", "cat")
-            .env("NO_COLOR", "1")
-            .envs(GIT_ENV)
-            .current_dir(&self.home)
+        sb_command(self, args)
             .output()
             .expect("failed to run cubby")
     }
@@ -120,6 +112,22 @@ impl Sandbox {
     fn history(&self) -> String {
         self.ok(&["history", "-v", "--all"])
     }
+}
+
+/// cubby, set up to run in the sandbox.
+fn sb_command(sb: &Sandbox, args: &[&str]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cubby"));
+    cmd.args(args)
+        .env("CUBBY_HOME", &sb.home)
+        .env_remove("CUBBY_STORE")
+        .env_remove("CUBBY_PAGER")
+        .env("PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .envs(GIT_ENV)
+        .current_dir(&sb.home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd
 }
 
 /// Keep git away from the real configuration, and give it an identity.
@@ -1333,6 +1341,48 @@ fn git_is_watched_but_never_driven() {
     outer.ok(&["~/.zshrc", "-y"]);
     let text = outer.ok(&["status"]);
     assert!(text.contains("store: 2 changes to commit"), "{text}");
+}
+
+#[test]
+fn git_ignore_checks_handle_negations_and_many_files() {
+    let sb = Sandbox::ready();
+    git(&sb.store, "init -q");
+    fs::write(sb.store_path(".gitignore"), "*.conf\n!keep.conf\n").unwrap();
+    sb.write_home(".config/app/keep.conf", "k\n");
+    sb.write_home(".config/app/other.conf", "o\n");
+    let text = sb.ok(&["~/.config/app", "-y"]);
+    assert!(text.contains("git ignores 1 file just saved"), "{text}");
+    assert!(
+        text.contains("other.conf  *.conf in .gitignore:1"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("keep.conf in"),
+        "a negated rule keeps it: {text}"
+    );
+
+    // Enough ignored paths to fill both pipes: this used to hang.
+    let long = "a-rather-long-file-name-to-fill-the-pipe-quickly";
+    for i in 0..2500 {
+        sb.write_home(&format!(".config/many/{long}-{i:04}.conf"), "x\n");
+    }
+    let mut child = sb_command(&sb, &["~/.config/many", "-y"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("cubby hung checking git's ignore rules");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[test]

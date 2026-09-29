@@ -83,14 +83,24 @@ pub fn ignored(store: &Path, rels: &[Rel]) -> Vec<Ignored> {
     let Ok(mut child) = child else {
         return Vec::new();
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        for rel in rels {
-            let path = repo.within.join(rel.as_str());
-            let _ = stdin.write_all(path.as_os_str().as_bytes());
-            let _ = stdin.write_all(b"\0");
-        }
+    // Write the paths from another thread while this one reads the
+    // answers: with enough of both, each side would fill its pipe and wait
+    // for the other forever.
+    let mut input = Vec::new();
+    for rel in rels {
+        input.extend_from_slice(repo.within.join(rel.as_str()).as_os_str().as_bytes());
+        input.push(0);
     }
-    let Ok(out) = child.wait_with_output() else {
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        })
+    });
+    let out = child.wait_with_output();
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    let Ok(out) = out else {
         return Vec::new();
     };
     // Records of four fields: source, line number, pattern, path.
@@ -100,6 +110,11 @@ pub fn ignored(store: &Path, rels: &[Rel]) -> Vec<Ignored> {
     while let (Some(source), Some(line), Some(pattern), Some(path)) =
         (fields.next(), fields.next(), fields.next(), fields.next())
     {
+        // --verbose also reports paths whose last match is a negation
+        // (`!keep.conf`): those are not ignored.
+        if pattern.starts_with(b"!") {
+            continue;
+        }
         let path = PathBuf::from(text(path));
         let Some(rel) = path
             .strip_prefix(&repo.within)

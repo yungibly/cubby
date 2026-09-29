@@ -764,8 +764,18 @@ impl Ctx {
                     "they will"
                 }
             ));
-            for i in &ignored {
+            let cap = if self.verbose { usize::MAX } else { 10 };
+            for i in ignored.iter().take(cap) {
                 eprintln!("  {}  {}", i.rel.as_str(), self.estyle.dim(&i.rule));
+            }
+            if ignored.len() > cap {
+                eprintln!(
+                    "  {}",
+                    self.estyle.dim(&format!(
+                        "… and {} more (use --verbose to list all)",
+                        ignored.len() - cap
+                    ))
+                );
             }
         }
     }
