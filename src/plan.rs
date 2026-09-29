@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::fsx::{self, Kind, Perms};
 use crate::index::{self, Index};
@@ -146,6 +146,9 @@ pub enum Skip {
     /// back. Needs `--force`.
     DeletedFromStore,
     Conflict(String),
+    /// A directory on one side and something else on the other; `--force`
+    /// does not help, since cubby never replaces a directory.
+    DirConflict(String),
     Error(String),
 }
 
@@ -195,7 +198,12 @@ impl Plan {
     pub fn troubled(&self) -> usize {
         self.skipped
             .iter()
-            .filter(|s| matches!(s.why, Skip::Conflict(_) | Skip::Error(_)))
+            .filter(|s| {
+                matches!(
+                    s.why,
+                    Skip::Conflict(_) | Skip::DirConflict(_) | Skip::Error(_)
+                )
+            })
             .count()
     }
 
@@ -230,6 +238,9 @@ pub fn plan(
     let mut plan = Plan::new(kind);
     for e in &scan.entries {
         plan_entry(&mut plan, e, scan, layout, modes, direction, force);
+    }
+    if direction == Direction::Save {
+        adopt_replaced_dirs(&mut plan, scan, layout, modes, force);
     }
     match direction {
         Direction::Save => plan_records(&mut plan, scan, modes, force),
@@ -280,9 +291,48 @@ pub fn sync_plan(scan: &Scan, layout: &Layout, modes: &BTreeMap<Rel, u32>) -> Pl
         };
         plan_entry(&mut plan, e, scan, layout, modes, direction, false);
     }
+    adopt_replaced_dirs(&mut plan, scan, layout, modes, false);
     plan_records(&mut plan, scan, modes, false);
     plan_chmods(&mut plan, scan);
     plan
+}
+
+/// A file or link that took a directory's place at home can take its place
+/// in the store too, once everything under that directory is being removed
+/// from the store (removals run first).
+fn adopt_replaced_dirs(
+    plan: &mut Plan,
+    scan: &Scan,
+    layout: &Layout,
+    modes: &BTreeMap<Rel, u32>,
+    force: bool,
+) {
+    let removed: Vec<Rel> = plan
+        .actions
+        .iter()
+        .filter(|a| a.op == Op::Remove)
+        .map(|a| a.rel.clone())
+        .collect();
+    for e in &scan.entries {
+        let State::Conflict {
+            home: Kind::File | Kind::Symlink,
+            store: Kind::Dir,
+        } = e.state
+        else {
+            continue;
+        };
+        let emptied = scan
+            .entries
+            .iter()
+            .filter(|x| x.rel != e.rel && x.rel.is_within(&e.rel) && x.store.is_some())
+            .all(|x| removed.contains(&x.rel));
+        if emptied {
+            plan.skipped.retain(|s| s.rel != e.rel);
+            let mut adopted = e.clone();
+            adopted.state = State::New { was_stored: false };
+            plan_entry(plan, &adopted, scan, layout, modes, Direction::Save, force);
+        }
+    }
 }
 
 /// Plan what copying one path in `direction` takes, or why it is skipped.
@@ -422,7 +472,9 @@ fn plan_entry(
                 store.describe()
             );
             let replaceable = !matches!(home, Kind::Dir) && !matches!(store, Kind::Dir);
-            if force && replaceable {
+            if !replaceable {
+                plan.skipped.push(skip(Skip::DirConflict(text)));
+            } else if force {
                 let note = match dir {
                     Direction::Save => format!("{text}; replacing the store copy"),
                     Direction::Restore => format!("{text}; replacing the home copy"),
@@ -610,7 +662,14 @@ pub fn apply(
 ) -> Outcome {
     let mut done = 0;
     let mut failed = Vec::new();
-    for action in &plan.actions {
+    // Removals first: a file can only take a directory's place once what
+    // was in the directory is gone.
+    let order = plan
+        .actions
+        .iter()
+        .filter(|a| a.op == Op::Remove)
+        .chain(plan.actions.iter().filter(|a| a.op != Op::Remove));
+    for action in order {
         let base = index.base(&action.rel);
         match perform(action, layout, run) {
             Ok(performed) => {
@@ -669,6 +728,16 @@ struct Performed {
 
 fn perform(action: &Action, layout: &Layout, run: &mut Run) -> Result<Performed> {
     let rel = &action.rel;
+    // The scan already refuses these; this makes sure nothing is ever
+    // written outside the store through a link in it.
+    if action.side == Side::Store
+        && let Some(link) = fsx::symlink_under(&layout.store, &action.dst)
+    {
+        bail!(
+            "{} in the store is a symlink; cubby will not write through it",
+            link.display()
+        );
+    }
     let mut done = Performed {
         backed_up: false,
         mode_before: None,

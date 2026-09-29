@@ -569,6 +569,10 @@ impl Ctx {
                     );
                     unstored += 1;
                 }
+                Skip::DirConflict(text) => row(
+                    &self.style.red("!"),
+                    &format!("{text}; cubby never replaces a directory"),
+                ),
                 Skip::Conflict(text) if plan.kind == RunKind::Sync => {
                     row(&self.style.red("!"), text);
                     conflicts += 1;

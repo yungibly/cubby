@@ -309,6 +309,24 @@ pub fn remove_entry(path: &Path, prune_to: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// The first directory between `root` and `path` (not counting either) that
+/// is a symlink. Writing to `path` would go wherever that link points.
+pub fn symlink_under(root: &Path, path: &Path) -> Option<PathBuf> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut dir = root.to_path_buf();
+    let mut parts: Vec<_> = rel.components().collect();
+    parts.pop();
+    for part in parts {
+        dir.push(part);
+        match fs::symlink_metadata(&dir) {
+            Ok(md) if md.file_type().is_symlink() => return Some(dir),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Remove empty directories from `start` upward, stopping at `stop`.
 pub fn prune_empty_dirs(start: Option<&Path>, stop: &Path) {
     let mut dir = start;
@@ -476,6 +494,21 @@ mod tests {
         assert!(root.exists());
         assert!(lstat(&root.join("nope/x")).unwrap().is_none());
         assert!(lstat(&root).unwrap().is_some());
+    }
+
+    #[test]
+    fn symlinked_directories_on_the_way_are_found() {
+        let sb = sandbox();
+        let root = sb.path().join("root");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        std::os::unix::fs::symlink(sb.path(), root.join("a/link")).unwrap();
+        assert_eq!(symlink_under(&root, &root.join("a/b/file")), None);
+        assert_eq!(
+            symlink_under(&root, &root.join("a/link/x/file")),
+            Some(root.join("a/link"))
+        );
+        // The path itself being a link is not "on the way".
+        assert_eq!(symlink_under(&root, &root.join("a/link")), None);
     }
 
     #[test]

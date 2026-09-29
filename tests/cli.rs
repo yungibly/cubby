@@ -538,6 +538,79 @@ fn naming_a_symlinked_directory_explains_what_is_saved() {
 }
 
 #[test]
+fn nothing_is_written_through_links_in_the_store() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/nvim/init.lua", "a\n");
+    sb.ok(&["~/.config/nvim", "-y"]);
+    // In the store, lua/ is a link (another machine saved it as one) that
+    // here leads out of the store.
+    let outside = sb.home.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, sb.store_path(".config/nvim/lua")).unwrap();
+    sb.write_home(".config/nvim/lua/x.lua", "x\n");
+
+    let text = sb.fail(&["-y"]);
+    assert!(
+        text.contains(
+            ".config/nvim/lua in the store is a symlink; cubby will not write through it"
+        ),
+        "{text}"
+    );
+    sb.fail(&["~/.config/nvim/lua/x.lua", "-y"]);
+    sb.fail(&["sync", "-y"]);
+    assert!(!outside.join("x.lua").exists());
+}
+
+#[test]
+fn stow_links_are_left_alone_even_when_forced() {
+    let sb = Sandbox::ready();
+    sb.write_home(".zshrc", "z\n");
+    sb.ok(&["~/.zshrc", "-y"]);
+    fs::remove_file(sb.home_path(".zshrc")).unwrap();
+    std::os::unix::fs::symlink(".dotfiles/.zshrc", sb.home_path(".zshrc")).unwrap();
+
+    let text = sb.fail(&["save", "--force", "-y"]);
+    assert!(
+        text.contains("a symlink into the store (as stow makes)"),
+        "{text}"
+    );
+    let stored = fs::symlink_metadata(sb.store_path(".zshrc")).unwrap();
+    assert!(stored.file_type().is_file());
+    assert_eq!(sb.read_store(".zshrc"), "z\n");
+}
+
+#[test]
+fn a_directory_that_became_a_file_or_a_link() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.write_home(".config/app/sub/x.conf", "x\n");
+    sb.ok(&["~/.config/app", "-y"]);
+
+    // Became a file: the old files leave the store and the file takes the
+    // directory's place, in one run.
+    fs::remove_dir_all(sb.home_path(".config/app/sub")).unwrap();
+    sb.write_home(".config/app/sub", "now a file\n");
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("- .config/app/sub/x.conf"), "{text}");
+    assert_eq!(sb.read_store(".config/app/sub"), "now a file\n");
+
+    // Became a link to a directory that holds the same file: a conflict
+    // that --force cannot settle, reported as such rather than as "new".
+    fs::remove_file(sb.home_path(".config/app/sub")).unwrap();
+    fs::remove_file(sb.store_path(".config/app/sub")).unwrap();
+    sb.write_store(".config/app/sub/x.conf", "x\n");
+    sb.write_home("elsewhere/x.conf", "x\n");
+    std::os::unix::fs::symlink("../../elsewhere", sb.home_path(".config/app/sub")).unwrap();
+    let text = sb.ok(&["status"]);
+    assert!(
+        text.contains("home has a symlink, store has a directory"),
+        "{text}"
+    );
+    let text = sb.fail(&["save", "--force", "-y"]);
+    assert!(text.contains("cubby never replaces a directory"), "{text}");
+}
+
+#[test]
 fn conflicts_are_skipped_unless_forced() {
     let sb = Sandbox::ready();
     sb.write_home(".zshrc", "file\n");

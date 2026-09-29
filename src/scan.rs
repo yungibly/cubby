@@ -538,15 +538,45 @@ impl Scanner<'_> {
         base: Base,
         under_present_dir: bool,
     ) -> Classified {
+        // A link at home into the store, as stow makes: copying it over the
+        // file it points to would leave a link pointing at itself.
+        if let Some(h) = home
+            && h.kind == Kind::Symlink
+            && self.points_into_store(h)
+        {
+            return Classified::state(State::Error(
+                "a symlink into the store (as stow makes); cubby copies files instead: remove the link and `cubby restore` puts a copy here".into(),
+            ));
+        }
         match (home, store) {
             (Some(h), Some(s)) if h.kind != s.kind => Classified::state(State::Conflict {
                 home: h.kind,
                 store: s.kind,
             }),
             (Some(h), Some(s)) => self.compare(rel, h, s, base),
-            (Some(h), None) => Classified::state(unreadable(h).unwrap_or(State::New {
-                was_stored: base.exists(),
-            })),
+            (Some(h), None) => {
+                let stored = self.layout.stored(rel);
+                // Never write through a link in the store (it could lead
+                // anywhere), and never over a directory there.
+                if let Some(link) = fsx::symlink_under(&self.layout.store, &stored) {
+                    let link = link.strip_prefix(&self.layout.store).unwrap_or(&link);
+                    return Classified::state(State::Error(format!(
+                        "{} in the store is a symlink; cubby will not write through it",
+                        link.display()
+                    )));
+                }
+                if let Ok(Some(m)) = fsx::lstat(&stored)
+                    && m.kind == Kind::Dir
+                {
+                    return Classified::state(State::Conflict {
+                        home: h.kind,
+                        store: Kind::Dir,
+                    });
+                }
+                Classified::state(unreadable(h).unwrap_or(State::New {
+                    was_stored: base.exists(),
+                }))
+            }
             (None, Some(s)) => {
                 if let Some(e) = unreadable(s) {
                     return Classified::state(e);
@@ -575,6 +605,21 @@ impl Scanner<'_> {
             }
             (None, None) => Classified::state(State::Error("vanished during scan".into())),
         }
+    }
+
+    /// Whether a symlink leads into the store, following its target from
+    /// where the link is, even when the target does not exist.
+    fn points_into_store(&self, link: &Meta) -> bool {
+        let store = &self.layout.store;
+        if std::fs::canonicalize(&link.path).is_ok_and(|t| t.starts_with(store)) {
+            return true;
+        }
+        let (Some(target), Some(parent)) = (&link.target, link.path.parent()) else {
+            return false;
+        };
+        std::fs::canonicalize(parent)
+            .map(|p| crate::paths::normalize(&p.join(target)).starts_with(store))
+            .unwrap_or(false)
     }
 
     /// Compare two paths of the same kind by fingerprint, reading only what
