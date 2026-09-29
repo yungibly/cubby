@@ -1506,6 +1506,21 @@ fn global_flags_work_before_the_command() {
 }
 
 #[test]
+fn large_files_are_pointed_out() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/app/settings.json", "{}\n");
+    sb.write_home(".config/app/cache.db", &"x".repeat(6 * 1024 * 1024));
+    let text = sb.ok(&["~/.config/app", "-n"]);
+    assert!(
+        text.contains("cache.db") && text.contains("large: 6.0 MiB"),
+        "{text}"
+    );
+    assert!(text.contains("1 file over 5.0 MiB marked above"), "{text}");
+    let small = text.lines().find(|l| l.contains("settings.json")).unwrap();
+    assert!(!small.contains("large"), "{text}");
+}
+
+#[test]
 fn completion_and_version() {
     let sb = Sandbox::new();
     let text = sb.ok(&["completion", "zsh"]);

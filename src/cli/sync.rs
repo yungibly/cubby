@@ -19,6 +19,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], allow_secrets: bool) -> Result<i32> 
     let mut plan = plan::sync_plan(&scan, &ctx.cfg.layout, &ctx.manifest.modes);
     failures += plan.troubled();
     let secrets = ctx.mark_secrets(&mut plan);
+    let large = ctx.mark_large(&mut plan);
 
     for n in &scan.notes {
         ctx.warn(&format!("{}: {}", n.path, n.why));
@@ -47,6 +48,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], allow_secrets: bool) -> Result<i32> 
     }
     ctx.print_skipped(&plan);
     ctx.warn_secrets(&secrets);
+    ctx.warn_large(large);
 
     let saves = to_store.actions.len() + to_store.standalone_records().count();
     let restores = to_home.actions.len();

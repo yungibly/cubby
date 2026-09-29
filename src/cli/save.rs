@@ -113,9 +113,11 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool, allow_secrets: bool) ->
     }
 
     println!("{} {}", ctx.style.bold("save →"), ctx.store_label());
+    let large = ctx.mark_large(&mut plan);
     ctx.print_plan(&plan);
     ctx.print_skipped(&plan);
     ctx.warn_secrets(&secrets);
+    ctx.warn_large(large);
 
     let copies = plan.count(Op::Create) + plan.count(Op::Overwrite);
     let removals = plan.count(Op::Remove);

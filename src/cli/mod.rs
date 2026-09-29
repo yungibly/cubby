@@ -626,6 +626,33 @@ impl Ctx {
         found
     }
 
+    /// Mark files a plan copies into the store that are large enough to be
+    /// a mistake (caches, downloads), and return how many there are.
+    pub fn mark_large(&self, plan: &mut Plan) -> usize {
+        let mut n = 0;
+        for a in &mut plan.actions {
+            if a.side == Side::Store && a.len > LARGE_FILE {
+                a.note
+                    .push_str(&format!("; large: {}", crate::fsx::human_size(a.len)));
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// After the plan: say why large files were marked.
+    pub fn warn_large(&self, n: usize) {
+        if n > 0 {
+            self.warn(&format!(
+                "{} over {} marked above; git handles big files poorly, so if {} a cache, `cubby ignore PATTERN` keeps {} out",
+                ui::plural(n, "file", "files"),
+                crate::fsx::human_size(LARGE_FILE),
+                if n == 1 { "it is" } else { "they are" },
+                if n == 1 { "it" } else { "them" }
+            ));
+        }
+    }
+
     /// Warn about files that look like secrets, before the plan's question.
     pub fn warn_secrets(&self, secrets: &[Rel]) {
         if !secrets.is_empty() {
@@ -842,6 +869,9 @@ impl Ctx {
         Ok(if outcome.failed.is_empty() { 0 } else { 1 })
     }
 }
+
+/// Files bigger than this are pointed out before they go into the store.
+pub const LARGE_FILE: u64 = 5 * 1024 * 1024;
 
 /// The ignore rules for a store: built in, the manifest's, `skip`, and
 /// cubby's own files.
