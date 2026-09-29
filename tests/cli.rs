@@ -1209,6 +1209,81 @@ fn one_cubby_changes_files_at_a_time() {
 }
 
 #[test]
+fn git_is_watched_but_never_driven() {
+    let sb = Sandbox::ready();
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("store: not a git repository"), "{text}");
+    git(&sb.store, "init -q");
+    sb.write_home(".zshrc", "z\n");
+    sb.ok(&["~/.zshrc", "-y"]);
+    let text = sb.ok(&["status"]);
+    assert!(text.contains("store: 2 changes to commit"), "{text}");
+    sb.ok(&["git", "add", "-A"]);
+    sb.ok(&["git", "commit", "-qm", "dots"]);
+    let text = sb.ok(&["status"]);
+    assert!(
+        text.contains("store: committed (no upstream to push to)"),
+        "{text}"
+    );
+    assert_eq!(sb.ok(&["git", "log", "-n", "1", "--format=%s"]), "dots\n");
+
+    // A global gitignore saved into the store hides other dotfiles from git.
+    sb.write_home(".gitignore", "*.local\n");
+    sb.write_home(".zshrc.local", "alias x=y\n");
+    let text = sb.ok(&["~/.gitignore", "~/.zshrc.local", "-y"]);
+    assert!(
+        text.contains(".gitignore sits at the root of the store"),
+        "{text}"
+    );
+    assert!(text.contains("git ignores 1 file just saved"), "{text}");
+    assert!(
+        text.contains(".zshrc.local  *.local in .gitignore:1"),
+        "{text}"
+    );
+
+    // A store inside a larger repository counts only its own part of it.
+    let outer = Sandbox::new();
+    git(&outer.home, "init -q");
+    outer.ok(&["init"]);
+    outer.write_home("notes.txt", "unrelated\n");
+    outer.write_home(".zshrc", "z\n");
+    outer.ok(&["~/.zshrc", "-y"]);
+    let text = outer.ok(&["status"]);
+    assert!(text.contains("store: 2 changes to commit"), "{text}");
+}
+
+#[test]
+fn init_can_clone_a_store() {
+    let a = Sandbox::ready();
+    a.write_home(".zshrc", "z\n");
+    a.ok(&["~/.zshrc", "-y"]);
+    git(&a.store, "init -q && git add -A && git commit -qm dots");
+
+    let b = Sandbox::new();
+    let url = format!("file://{}", a.store.display());
+    let text = b.ok(&["init", &url]);
+    assert!(text.contains("cloned"), "{text}");
+    assert!(
+        text.contains("+ .zshrc") && text.contains("new in the store"),
+        "{text}"
+    );
+    assert!(text.contains("dry run"), "{text}");
+    assert!(!b.home_path(".zshrc").exists());
+    let text = b.ok(&["status"]);
+    assert!(
+        text.contains("store: committed, up to date with origin/"),
+        "{text}"
+    );
+    b.ok(&["restore", "-y"]);
+    assert_eq!(b.read_home(".zshrc"), "z\n");
+
+    let text = b.fail(&["init", &url, "--force"]);
+    assert!(text.contains("already exists and is not empty"), "{text}");
+    let text = b.fail(&["init", "~/a", "~/b"]);
+    assert!(text.contains("is not a repository URL"), "{text}");
+}
+
+#[test]
 fn history_lists_operations() {
     let sb = Sandbox::ready();
     let text = sb.ok(&["history"]);

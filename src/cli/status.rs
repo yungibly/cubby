@@ -269,6 +269,9 @@ pub fn run(ctx: &mut Ctx, paths: &[String], quiet: bool) -> Result<i32> {
             );
         }
     }
+    if scope.is_all() {
+        ctx.print_git_state();
+    }
     Ok(if failures > 0 { 1 } else { 0 })
 }
 

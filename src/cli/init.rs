@@ -8,7 +8,15 @@ use crate::manifest::Manifest;
 use crate::paths::{expand_tilde, expand_tilde_path, normalize, pretty};
 use crate::ui::Style;
 
-pub fn run(global: &Global, dir: Option<&str>, force: bool) -> Result<i32> {
+pub fn run(global: &Global, target: Option<&str>, dir: Option<&str>, force: bool) -> Result<i32> {
+    let (url, dir) = match (target, dir) {
+        (Some(t), d) if crate::git::is_url(t) => (Some(t), d),
+        (Some(t), None) => (None, Some(t)),
+        (Some(t), Some(_)) => bail!(
+            "{t} is not a repository URL; `cubby init DIR` takes one directory, `cubby init URL DIR` clones"
+        ),
+        (None, _) => (None, None),
+    };
     let style = Style::detect(global.color);
     let env = Env::detect()?;
     let config_path = match &global.config {
@@ -42,6 +50,17 @@ pub fn run(global: &Global, dir: Option<&str>, force: bool) -> Result<i32> {
 
     // Write the store path the way the user thinks of it.
     let typed = display(&store);
+
+    if let Some(url) = url {
+        let occupied = std::fs::read_dir(&store).is_ok_and(|mut d| d.next().is_some());
+        if occupied {
+            bail!(
+                "{typed} already exists and is not empty; clone into another directory with `cubby init {url} DIR`"
+            );
+        }
+        crate::git::clone(url, &store)?;
+        println!("{} cloned {url} into {typed}", style.green("✓"));
+    }
 
     if config_path.exists() && !force {
         let existing = Config::load(&config::Overrides {
@@ -95,6 +114,32 @@ pub fn run(global: &Global, dir: Option<&str>, force: bool) -> Result<i32> {
             style.green("✓"),
             crate::manifest::FILE_NAME
         );
+    }
+
+    if url.is_some() {
+        // Show what the new store would bring, without doing it.
+        println!();
+        let mut preview = global.clone();
+        preview.dry_run = true;
+        let mut ctx = super::Ctx::load(&preview)?;
+        super::restore::run(&mut ctx, &[], false)?;
+        println!();
+        println!("{}", style.dim("next:"));
+        println!(
+            "{}",
+            style.dim(&format!(
+                "  {:<32} copy the store into your home directory",
+                "cubby restore"
+            ))
+        );
+        println!(
+            "{}",
+            style.dim(&format!(
+                "  {:<32} skip what this machine should not have",
+                "cubby ignore --here PATH"
+            ))
+        );
+        return Ok(0);
     }
 
     println!();

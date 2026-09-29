@@ -86,6 +86,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], allow_secrets: bool) -> Result<i32> 
         ctx.manifest.set_mode(&r.rel, r.to);
     }
     let code = ctx.run_plan(&plan)?;
+    ctx.warn_git(&plan);
     Ok(if failures > 0 { 1 } else { code })
 }
 

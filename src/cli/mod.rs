@@ -210,14 +210,31 @@ enum Command {
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         path: Option<String>,
     },
-    /// Create the config file and the store
+    /// Create the config file and the store, or clone a store
+    ///
+    /// `cubby init URL [DIR]` clones a store (from github.com, say) for a
+    /// new machine and shows what `cubby restore` would copy.
     Init {
-        /// Where the store should live (default: ~/.dotfiles)
+        /// A repository to clone, or where the store should live
+        /// (default: ~/.dotfiles)
+        #[arg(value_name = "URL|DIR", value_hint = clap::ValueHint::DirPath)]
+        target: Option<String>,
+        /// Where to clone to, after a URL
         #[arg(value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         dir: Option<String>,
         /// Overwrite an existing config file
         #[arg(long)]
         force: bool,
+    },
+    /// Run git in the store: `cubby git status`, `cubby git push`
+    #[command(disable_help_flag = true)]
+    Git {
+        #[arg(
+            value_name = "ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        args: Vec<std::ffi::OsString>,
     },
     /// Print a shell completion script
     #[command(hide = true)]
@@ -660,6 +677,80 @@ impl Ctx {
         Ok(secrets.len())
     }
 
+    /// After saving: warn about saved files git will never commit, and
+    /// about files that git reads as settings for the store repository.
+    pub fn warn_git(&self, plan: &Plan) {
+        let saved: Vec<Rel> = plan
+            .actions
+            .iter()
+            .filter(|a| a.side == Side::Store && matches!(a.op, Op::Create | Op::Overwrite))
+            .map(|a| a.rel.clone())
+            .collect();
+        for rel in saved.iter().filter(|r| crate::git::is_repo_setting(r)) {
+            self.warn(&format!(
+                "{rel} sits at the root of the store, so git also applies it to the store's own repository"
+            ));
+        }
+        let ignored = crate::git::ignored(&self.cfg.layout.store, &saved);
+        if !ignored.is_empty() {
+            self.warn(&format!(
+                "git ignores {}, so {} never be committed or reach another machine:",
+                ui::plural(ignored.len(), "file just saved", "files just saved"),
+                if ignored.len() == 1 {
+                    "it will"
+                } else {
+                    "they will"
+                }
+            ));
+            for i in &ignored {
+                eprintln!("  {}  {}", i.rel.as_str(), self.estyle.dim(&i.rule));
+            }
+        }
+    }
+
+    /// One line about the store's repository: changes to commit, commits
+    /// to push or pull. Forgetting those is how dotfiles fail to follow you.
+    pub fn print_git_state(&self) {
+        let store = &self.cfg.layout.store;
+        let Some(g) = crate::git::state(store) else {
+            if !store.join(".git").exists() {
+                // Git missing, or the store not in a repository (or in
+                // one that ignores it).
+                println!(
+                    "{}",
+                    self.style
+                        .dim("store: not a git repository; `cubby git init` versions it")
+                );
+            }
+            return;
+        };
+        let mut parts = Vec::new();
+        if g.changes > 0 {
+            parts.push(format!(
+                "{} to commit",
+                ui::plural(g.changes, "change", "changes")
+            ));
+        }
+        if g.ahead > 0 {
+            parts.push(format!(
+                "{} to push",
+                ui::plural(g.ahead as usize, "commit", "commits")
+            ));
+        }
+        if g.behind > 0 {
+            parts.push(format!(
+                "{} to pull",
+                ui::plural(g.behind as usize, "commit", "commits")
+            ));
+        }
+        let line = match (parts.is_empty(), &g.upstream) {
+            (true, Some(up)) => format!("store: committed, up to date with {up}"),
+            (true, None) => "store: committed (no upstream to push to)".to_owned(),
+            (false, _) => format!("store: {}", parts.join(" · ")),
+        };
+        println!("{}", self.style.dim(&line));
+    }
+
     /// The line for a plan with nothing to do: `done` when that is because
     /// everything is up to date, a pointer to the skipped paths otherwise.
     pub fn print_nothing_to_do(&self, plan: &Plan, done: &str) {
@@ -879,7 +970,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let ctx = Ctx::load(&global)?;
             backups::run(&ctx, path.as_deref())
         }
-        Some(Command::Init { dir, force }) => init::run(&global, dir.as_deref(), force),
+        Some(Command::Init { target, dir, force }) => {
+            init::run(&global, target.as_deref(), dir.as_deref(), force)
+        }
+        Some(Command::Git { args }) => {
+            let ctx = Ctx::load(&global)?;
+            ctx.require_store()?;
+            crate::git::passthrough(&ctx.cfg.layout.store, &args)
+        }
         Some(Command::Completion { shell }) => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "cubby", &mut std::io::stdout());

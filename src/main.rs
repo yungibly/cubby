@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod diff;
 mod fsx;
+mod git;
 mod ignore;
 mod index;
 mod lock;
