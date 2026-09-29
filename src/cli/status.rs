@@ -264,7 +264,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], quiet: bool) -> Result<i32> {
             println!(
                 "{}",
                 style.dim(
-                    "a file deleted from the store is not saved again unless you pass `cubby save --force PATH`; delete it at home to finish the deletion"
+                    "a file deleted from the store is saved again only when named: `cubby save PATH`; if it was deleted on purpose, delete it here too"
                 )
             );
         }

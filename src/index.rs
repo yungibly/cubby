@@ -150,6 +150,9 @@ impl Record {
 pub struct Index {
     path: PathBuf,
     store: PathBuf,
+    /// Device and inode of the store directory: a store deleted and made
+    /// again (or cloned afresh) is a different store, whatever its path.
+    store_id: String,
     records: BTreeMap<Rel, Record>,
     /// Whether there was an index file to load.
     existed: bool,
@@ -170,9 +173,14 @@ impl Index {
     /// nothing but a slower scan.
     pub fn load(state_dir: &Path, store: &Path) -> Index {
         let path = Index::path_for(state_dir, store);
+        let store_id = fsx::lstat(store)
+            .ok()
+            .flatten()
+            .map_or_else(String::new, |m| format!("{}:{}", m.dev, m.ino));
         let mut index = Index {
             path,
             store: store.to_path_buf(),
+            store_id,
             records: BTreeMap::new(),
             existed: false,
             changed: false,
@@ -181,7 +189,13 @@ impl Index {
             return index;
         };
         let mut lines = text.lines();
-        if !lines.next().is_some_and(|h| h.starts_with(HEADER)) {
+        let header = lines.next().unwrap_or_default();
+        let same_store = header.starts_with(HEADER)
+            && header.rsplit('\t').next() == Some(index.store_id.as_str())
+            && !index.store_id.is_empty();
+        if !same_store {
+            // Written for a store that is gone: nothing in it holds here.
+            index.changed = true;
             return index;
         }
         index.existed = true;
@@ -297,7 +311,11 @@ impl Index {
         if !self.changed {
             return Ok(());
         }
-        let mut out = format!("{HEADER}\t{}\n", escape(&self.store.to_string_lossy()));
+        let mut out = format!(
+            "{HEADER}\t{}\t{}\n",
+            escape(&self.store.to_string_lossy()),
+            self.store_id
+        );
         for (rel, r) in &self.records {
             let base = r.base.to_text();
             out.push_str(&format!(
@@ -500,6 +518,7 @@ mod tests {
     fn saves_and_loads_with_odd_names() {
         let sb = sandbox();
         let store = sb.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
         let mut index = Index::load(sb.path(), &store);
         assert!(!index.existed());
         let fp = Fp([7; 16]);
@@ -538,9 +557,37 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "not an index\n").unwrap();
         assert!(!Index::load(sb.path(), &store).existed());
-        std::fs::write(&path, format!("{HEADER}\tx\ngarbage\n.zshrc\t?\t-\t-\n")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let id = Index::load(sb.path(), &store).store_id;
+        std::fs::write(
+            &path,
+            format!("{HEADER}\tx\t{id}\ngarbage\n.zshrc\t?\t-\t-\n"),
+        )
+        .unwrap();
         let index = Index::load(sb.path(), &store);
         assert_eq!(index.records.len(), 1);
+    }
+
+    #[test]
+    fn a_store_made_again_starts_over() {
+        let sb = sandbox();
+        let store = sb.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let mut index = Index::load(sb.path(), &store);
+        index.synced(&rel(".zshrc"), Fp([1; 16]));
+        index.save().unwrap();
+        assert_eq!(
+            Index::load(sb.path(), &store).base(&rel(".zshrc")),
+            Base::Is(Fp([1; 16]))
+        );
+        // Deleted and created again: another directory at the same path.
+        let keep = sb.path().join("keep");
+        std::fs::rename(&store, &keep).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        assert_eq!(
+            Index::load(sb.path(), &store).base(&rel(".zshrc")),
+            Base::None
+        );
     }
 
     #[test]

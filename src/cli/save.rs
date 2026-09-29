@@ -83,6 +83,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool, allow_secrets: bool) ->
         &ctx.manifest.modes,
         Direction::Save,
         force,
+        &scope.rels,
     );
     failures += plan.troubled();
     let secrets = ctx.mark_secrets(&mut plan);

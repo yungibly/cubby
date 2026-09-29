@@ -310,8 +310,15 @@ impl Ctx {
             Err(_) => LockState::Unavailable,
         };
         let mut index = Index::load(&cfg.state_dir, &cfg.layout.store);
-        if !index.existed() {
-            index.import_legacy(runs::legacy_synced(&cfg.state_dir));
+        // Upgrading from cubby 2: once, before cubby 3 has kept an index on
+        // this machine, and only for what is in this store.
+        if !index.existed() && !cfg.state_dir.join("index").exists() {
+            let in_store = |rel: &Rel| cfg.layout.stored(rel).exists();
+            index.import_legacy(
+                runs::legacy_synced(&cfg.state_dir)
+                    .into_iter()
+                    .filter(in_store),
+            );
         }
         Ok(Ctx {
             cfg,
@@ -619,10 +626,9 @@ impl Ctx {
         }
         if unstored > 0 {
             self.note(&format!(
-                "  {} deleted from the store since the last sync {} not saved back: delete {} at home to finish the deletion, or `cubby save --force PATH` keeps one",
+                "  {} deleted from the store since the last sync {} not saved back: to keep one, name it (`cubby save PATH`); if it was deleted on purpose, delete it here too",
                 ui::plural(unstored, "file", "files"),
                 if unstored == 1 { "was" } else { "were" },
-                it_them(unstored),
             ));
         }
         if !kept.is_empty() {
@@ -819,7 +825,21 @@ impl Ctx {
     /// The line for a plan with nothing to do: `done` when that is because
     /// everything is up to date, a pointer to the skipped paths otherwise.
     pub fn print_nothing_to_do(&self, plan: &Plan, done: &str) {
+        let left = plan
+            .skipped
+            .iter()
+            .filter(|s| matches!(s.why, Skip::ChangedThere(_) | Skip::DeletedFromStore))
+            .count();
         match plan.troubled() {
+            0 if left > 0 => println!(
+                "{} {}",
+                self.style.dim("·"),
+                self.style.dim(&format!(
+                    "nothing {}; {} left alone (see above)",
+                    plan.kind.past(),
+                    ui::plural(left, "path", "paths")
+                ))
+            ),
             0 => println!("{} {}", self.style.green("✓"), self.style.dim(done)),
             n => println!(
                 "{} {}",

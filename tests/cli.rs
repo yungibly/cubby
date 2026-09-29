@@ -1244,6 +1244,51 @@ fn a_new_machine_never_mistakes_store_files_for_deletions() {
 }
 
 #[test]
+fn a_store_made_again_does_not_inherit_the_old_one() {
+    let sb = Sandbox::ready();
+    sb.write_home(".zshrc", "z\n");
+    sb.ok(&["~/.zshrc", "-y"]);
+    fs::remove_dir_all(&sb.store).unwrap();
+    sb.ok(&["init"]);
+    let text = sb.ok(&["~/.zshrc", "-y"]);
+    assert!(text.contains("+ .zshrc"), "{text}");
+    assert_eq!(sb.read_store(".zshrc"), "z\n");
+
+    // cubby 2's log does not seed a store it never saved to.
+    let other = Sandbox::ready();
+    other.write_home(".vimrc", "v\n");
+    other.write_home(
+        ".local/state/cubby/history.log",
+        "2026-01-01T00:00:00Z\tsave\t.vimrc\n",
+    );
+    let text = other.ok(&["~/.vimrc", "-y"]);
+    assert!(text.contains("+ .vimrc"), "{text}");
+}
+
+#[test]
+fn a_file_deleted_from_the_store_is_saved_again_by_name() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/app/a.conf", "a\n");
+    sb.write_home(".config/app/b.conf", "b\n");
+    sb.ok(&["~/.config/app", "-y"]);
+    // Another machine removed b.conf from the store.
+    fs::remove_file(sb.store_path(".config/app/b.conf")).unwrap();
+    let text = sb.ok(&["-y"]);
+    assert!(text.contains("nothing saved; 1 path left alone"), "{text}");
+    assert!(!text.contains("up to date"), "{text}");
+    assert!(!sb.store_path(".config/app/b.conf").exists());
+    let text = sb.ok(&["~/.config/app/b.conf", "-y"]);
+    assert!(text.contains("adding it back"), "{text}");
+    assert!(sb.store_path(".config/app/b.conf").exists());
+
+    // Naming a path does not save over a change from another machine.
+    sb.write_store(".config/app/a.conf", "from elsewhere\n");
+    let text = sb.ok(&["~/.config/app/a.conf", "-y"]);
+    assert!(text.contains("changed in the store; left alone"), "{text}");
+    assert_eq!(sb.read_store(".config/app/a.conf"), "from elsewhere\n");
+}
+
+#[test]
 fn upgrading_from_cubby_2_keeps_deletions_working() {
     let sb = Sandbox::ready();
     sb.write_home(".config/app/a.conf", "a\n");

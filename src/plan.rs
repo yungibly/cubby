@@ -223,13 +223,15 @@ impl Plan {
 }
 
 /// Plan a save or a restore of everything in `scan`. `modes` are the
-/// permissions the manifest records.
+/// permissions the manifest records; `named` are paths given by name, which
+/// are saved even if they were deleted from the store elsewhere.
 pub fn plan(
     scan: &Scan,
     layout: &Layout,
     modes: &BTreeMap<Rel, u32>,
     direction: Direction,
     force: bool,
+    named: &[Rel],
 ) -> Plan {
     let kind = match direction {
         Direction::Save => RunKind::Save,
@@ -237,7 +239,8 @@ pub fn plan(
     };
     let mut plan = Plan::new(kind);
     for e in &scan.entries {
-        plan_entry(&mut plan, e, scan, layout, modes, direction, force);
+        let by_name = named.contains(&e.rel);
+        plan_entry(&mut plan, e, scan, layout, modes, direction, force, by_name);
     }
     if direction == Direction::Save {
         adopt_replaced_dirs(&mut plan, scan, layout, modes, force);
@@ -289,7 +292,7 @@ pub fn sync_plan(scan: &Scan, layout: &Layout, modes: &BTreeMap<Rel, u32>) -> Pl
                 Direction::Save
             }
         };
-        plan_entry(&mut plan, e, scan, layout, modes, direction, false);
+        plan_entry(&mut plan, e, scan, layout, modes, direction, false, false);
     }
     adopt_replaced_dirs(&mut plan, scan, layout, modes, false);
     plan_records(&mut plan, scan, modes, false);
@@ -330,12 +333,24 @@ fn adopt_replaced_dirs(
             plan.skipped.retain(|s| s.rel != e.rel);
             let mut adopted = e.clone();
             adopted.state = State::New { was_stored: false };
-            plan_entry(plan, &adopted, scan, layout, modes, Direction::Save, force);
+            plan_entry(
+                plan,
+                &adopted,
+                scan,
+                layout,
+                modes,
+                Direction::Save,
+                force,
+                false,
+            );
         }
     }
 }
 
 /// Plan what copying one path in `direction` takes, or why it is skipped.
+/// A path given `by_name` is saved even if it was deleted from the store
+/// elsewhere; `force` also copies over changes made on the other side.
+#[allow(clippy::too_many_arguments)]
 fn plan_entry(
     plan: &mut Plan,
     e: &Entry,
@@ -344,6 +359,7 @@ fn plan_entry(
     modes: &BTreeMap<Rel, u32>,
     direction: Direction,
     force: bool,
+    by_name: bool,
 ) {
     let skip = |why: Skip| Skipped {
         rel: e.rel.clone(),
@@ -428,10 +444,12 @@ fn plan_entry(
         (State::New { was_stored: false }, Direction::Save) => {
             plan.actions.push(copy(Op::Create, "new".into()))
         }
-        (State::New { was_stored: true }, Direction::Save) if force => plan.actions.push(copy(
-            Op::Create,
-            "deleted from the store since the last sync; adding it back".into(),
-        )),
+        (State::New { was_stored: true }, Direction::Save) if force || by_name => {
+            plan.actions.push(copy(
+                Op::Create,
+                "deleted from the store since the last sync; adding it back".into(),
+            ))
+        }
         (State::New { was_stored: true }, Direction::Save) => {
             plan.skipped.push(skip(Skip::DeletedFromStore))
         }

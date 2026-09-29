@@ -20,6 +20,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
         &ctx.manifest.modes,
         Direction::Restore,
         force,
+        &[],
     );
     failures += plan.troubled();
     for n in &scan.notes {
