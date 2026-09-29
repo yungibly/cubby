@@ -134,12 +134,14 @@ fn parse(raw: &str) -> Result<Option<(Kind, Glob)>> {
     if p.is_empty() || p.starts_with('#') {
         return Ok(None);
     }
+    // `~/bin` and `/bin` are anchored at home even without another slash.
+    let anchored = p.starts_with("~/") || p.starts_with('/');
     let stripped = p
         .strip_prefix("~/")
         .or_else(|| p.strip_prefix('/'))
         .unwrap_or(p);
     let stripped = stripped.strip_suffix('/').unwrap_or(stripped);
-    if stripped.contains('/') {
+    if anchored || stripped.contains('/') {
         Ok(Some((Kind::Path, glob(stripped)?)))
     } else {
         Ok(Some((Kind::Name, glob(stripped)?)))
@@ -220,6 +222,17 @@ mod tests {
         assert!(ig.is_ignored(&rel(".ssh/id_ed25519")));
         assert!(!ig.is_ignored(&rel(".ssh/config")));
         assert!(!ig.is_ignored(&rel(".config/nvim")));
+    }
+
+    #[test]
+    fn a_leading_tilde_or_slash_anchors_a_name_at_home() {
+        let ig = ignore(&["~/bin", "/.cache", "tmp/"]);
+        assert!(ig.is_ignored(&rel("bin/tool")));
+        assert!(!ig.is_ignored(&rel(".config/tool/bin/helper")));
+        assert!(ig.is_ignored(&rel(".cache/x")));
+        assert!(!ig.is_ignored(&rel(".local/.cache/x")));
+        // A trailing slash alone does not anchor.
+        assert!(ig.is_ignored(&rel(".config/app/tmp/x")));
     }
 
     #[test]

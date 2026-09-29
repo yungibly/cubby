@@ -307,13 +307,16 @@ impl Manifest {
             to: mode,
         });
         let key = rel.to_string();
-        let table = self
+        let item = self
             .doc
             .as_table_mut()
             .entry("modes")
-            .or_insert_with(toml_edit::table)
-            .as_table_mut()
-            .expect("modes is a table");
+            .or_insert_with(toml_edit::table);
+        // Written either as a [modes] section or inline, `modes = { ... }`.
+        if item.as_table_like().is_none() {
+            *item = toml_edit::table();
+        }
+        let table = item.as_table_like_mut().expect("modes is a table");
         match mode {
             Some(m) => {
                 self.modes.insert(rel.clone(), m);
@@ -522,6 +525,16 @@ mod tests {
             to: Some(0o600),
         };
         assert!(!m.reverse(&stale));
+    }
+
+    #[test]
+    fn inline_modes_tables_can_be_edited() {
+        let mut m = Manifest::parse("modes = { \"~/.netrc\" = \"600\" }\n").unwrap();
+        assert!(m.set_mode(&rel(".ssh"), Some(0o700)));
+        assert!(m.set_mode(&rel(".netrc"), None));
+        let out = m.render();
+        assert!(out.contains("modes = { \"~/.ssh\" = \"700\" }"), "{out}");
+        assert_eq!(Manifest::parse(&out).unwrap(), m);
     }
 
     #[test]

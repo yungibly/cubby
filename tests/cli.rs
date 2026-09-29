@@ -1998,6 +1998,14 @@ fn status_quiet_uses_exit_codes() {
         Some(2)
     );
 
+    // Anything that stops cubby from telling is 2, not "differs".
+    let manifest = sb.manifest();
+    fs::write(sb.store_path(".cubby.toml"), "<<<<<<< HEAD\n").unwrap();
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(2));
+    fs::write(sb.store_path(".cubby.toml"), "version = 9\n").unwrap();
+    assert_eq!(sb.cmd(&["status", "-q"]).status.code(), Some(2));
+    fs::write(sb.store_path(".cubby.toml"), manifest).unwrap();
+
     // A tracked directory missing at home counts as dirty.
     sb.write_home(".config/app/a.conf", "a\n");
     sb.ok(&["~/.config/app", "-y"]);

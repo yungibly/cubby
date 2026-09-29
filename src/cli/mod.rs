@@ -1019,10 +1019,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let mut ctx = Ctx::load(&global)?;
             sync::run(&mut ctx, &paths, allow_secrets)
         }
-        Some(Command::Status { paths, quiet }) => {
-            let mut ctx = Ctx::load(&global)?;
-            status::run(&mut ctx, &paths, quiet)
-        }
+        Some(Command::Status { paths, quiet }) => match Ctx::load(&global) {
+            Ok(mut ctx) => status::run(&mut ctx, &paths, quiet),
+            // grep-style: 2 means "could not tell", never "differs".
+            Err(e) if quiet => {
+                let style = Style::detect_stderr(global.color);
+                eprintln!("{} {e:#}", style.red("error:"));
+                Ok(2)
+            }
+            Err(e) => Err(e),
+        },
         Some(Command::Diff {
             paths,
             reverse,
