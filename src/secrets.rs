@@ -75,14 +75,19 @@ const TOKENS: &[Token] = &[
 
 /// Why a file looks like a secret; `None` when it does not.
 pub fn check(meta: &Meta) -> Option<String> {
-    if meta.kind != Kind::File {
-        return None;
-    }
-    if perms::is_private(meta.mode) {
+    if meta.kind == Kind::File && perms::is_private(meta.mode) {
         return Some(format!(
             "it is private (mode {})",
             perms::show(meta.mode & 0o777)
         ));
+    }
+    check_content(meta)
+}
+
+/// Why a file's content looks like a secret: a private key or a token.
+pub fn check_content(meta: &Meta) -> Option<String> {
+    if meta.kind != Kind::File {
+        return None;
     }
     let mut data = Vec::new();
     File::open(&meta.path)

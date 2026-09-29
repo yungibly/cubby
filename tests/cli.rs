@@ -1521,6 +1521,54 @@ fn large_files_are_pointed_out() {
 }
 
 #[test]
+fn doctor_finds_what_status_cannot() {
+    let sb = Sandbox::ready();
+    sb.write_home(".zshrc", "z\n");
+    sb.ok(&["~/.zshrc", "-y"]);
+    // Problems an older cubby, or a person, could have left behind.
+    sb.write_store(".local/state/cubby/history.log", "old\n");
+    sb.write_store(
+        ".config/gh/hosts.yml",
+        &format!("oauth_token: ghp_{}\n", "a1B2".repeat(9)),
+    );
+    sb.write_store(".cache.db", &"x".repeat(6 * 1024 * 1024));
+    sb.write_store(".netrc", "machine x password y\n");
+    let manifest = sb
+        .manifest()
+        .replace("dirs = [\n]", "dirs = [\n  \"~/.config/gone\",\n]")
+        + "\n[modes]\n\"~/.netrc\" = \"600\"\n";
+    fs::write(sb.store_path(".cubby.toml"), manifest).unwrap();
+
+    let text = sb.fail(&["doctor"]);
+    for expected in [
+        "the store is not versioned with git",
+        "the store holds cubby's own files",
+        "1 file in the store looks like a secret",
+        ".config/gh/hosts.yml  it holds what looks like a GitHub token",
+        "1 file in the store is over 5.0 MiB",
+        "copies of private files in the store can be read by other users",
+        "`chmod 600 ~/.dotfiles/.netrc`",
+        "tracked directories with nothing in them anywhere",
+        "~/.config/gone",
+    ] {
+        assert!(text.contains(expected), "{expected:?} in\n{text}");
+    }
+
+    // A tidy store, committed and pushed, passes.
+    let tidy = Sandbox::ready();
+    tidy.write_home(".zshrc", "z\n");
+    tidy.ok(&["~/.zshrc", "-y"]);
+    git(&tidy.home, "init -q --bare remote.git");
+    git(
+        &tidy.store,
+        "init -q && git add -A && git commit -qm dots && git remote add origin ../remote.git && git push -q -u origin HEAD",
+    );
+    let text = tidy.ok(&["doctor"]);
+    assert!(text.contains("committed and pushed"), "{text}");
+    assert!(text.contains("no problems found"), "{text}");
+}
+
+#[test]
 fn completion_and_version() {
     let sb = Sandbox::new();
     let text = sb.ok(&["completion", "zsh"]);

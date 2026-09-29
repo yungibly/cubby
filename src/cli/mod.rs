@@ -2,6 +2,7 @@
 
 mod backups;
 mod diff;
+mod doctor;
 mod history;
 mod ignore;
 mod init;
@@ -226,6 +227,8 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Look for problems: files git ignores, secrets, loose permissions...
+    Doctor,
     /// Run git in the store: `cubby git status`, `cubby git push`
     #[command(disable_help_flag = true)]
     Git {
@@ -1003,6 +1006,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Some(Command::Init { target, dir, force }) => {
             init::run(&global, target.as_deref(), dir.as_deref(), force)
         }
+        Some(Command::Doctor) => doctor::run(&global),
         Some(Command::Git { args }) => {
             let ctx = Ctx::load(&global)?;
             ctx.require_store()?;
