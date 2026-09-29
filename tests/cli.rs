@@ -825,6 +825,9 @@ fn private_permissions_survive_a_fresh_clone() {
     b.ok(&["init"]);
     assert_eq!(mode(&b.store_path(".netrc")), 0o644);
     b.ok(&["restore", "-y"]);
+    // The store's own copies are private again too.
+    assert_eq!(mode(&b.store_path(".netrc")), 0o600);
+    assert_eq!(mode(&b.store_path(".ssh")), 0o700);
     assert_eq!(mode(&b.home_path(".netrc")), 0o600);
     assert_eq!(mode(&b.home_path(".ssh")), 0o700);
     assert_eq!(mode(&b.home_path(".ssh/config")), 0o600);

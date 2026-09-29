@@ -60,6 +60,14 @@ pub fn run(global: &Global, target: Option<&str>, dir: Option<&str>, force: bool
         }
         crate::git::clone(url, &store)?;
         println!("{} cloned {url} into {typed}", style.green("✓"));
+        // git checked private files out readable by everyone.
+        if let Ok(manifest) = Manifest::load(&store) {
+            let layout = crate::paths::Layout {
+                home: env.home.clone(),
+                store: real.clone(),
+            };
+            super::secure_store(&layout, &manifest);
+        }
     }
 
     if config_path.exists() && !force {

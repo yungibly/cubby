@@ -328,13 +328,18 @@ impl Ctx {
         })
     }
 
-    /// Commands that change files run one at a time.
+    /// Commands that change files run one at a time. Taking the turn also
+    /// tightens store copies of private files that a git checkout left
+    /// readable by others.
     pub fn require_lock(&self) -> Result<()> {
         if matches!(self.lock, LockState::Busy) && !self.dry_run {
             bail!(
                 "another cubby is running (it holds {}); try again when it has finished",
                 self.cfg.layout.pretty(&self.cfg.state_dir.join("lock"))
             );
+        }
+        if !self.dry_run {
+            secure_store(&self.cfg.layout, &self.manifest);
         }
         Ok(())
     }
@@ -539,6 +544,7 @@ impl Ctx {
         let mut deleted_here = 0;
         let mut new = 0;
         let mut kept = Vec::new();
+        let mut unstored = 0;
         let mut conflicts = 0;
         for s in &plan.skipped {
             let row = |symbol: &str, note: &str| {
@@ -561,7 +567,7 @@ impl Ctx {
                         &self.style.dim("·"),
                         "deleted from the store; not added back",
                     );
-                    kept.push(s);
+                    unstored += 1;
                 }
                 Skip::Conflict(text) if plan.kind == RunKind::Sync => {
                     row(&self.style.red("!"), text);
@@ -605,6 +611,14 @@ impl Ctx {
             self.note(&format!(
                 "  {} left for you: `cubby diff PATH` shows both sides, `cubby save --force PATH` or `cubby restore --force PATH` picks one",
                 ui::plural(conflicts, "path", "paths")
+            ));
+        }
+        if unstored > 0 {
+            self.note(&format!(
+                "  {} deleted from the store since the last sync {} not saved back: delete {} at home to finish the deletion, or `cubby save --force PATH` keeps one",
+                ui::plural(unstored, "file", "files"),
+                if unstored == 1 { "was" } else { "were" },
+                it_them(unstored),
             ));
         }
         if !kept.is_empty() {
@@ -877,6 +891,27 @@ impl Ctx {
             self.warn(&format!("could not remove old backups: {e:#}"));
         }
         Ok(if outcome.failed.is_empty() { 0 } else { 1 })
+    }
+}
+
+/// Give store copies of recorded files and directories no more access than
+/// their records: git checks files out as 644 or 755 whatever they were.
+/// Best effort; `cubby doctor` reports what is still too open.
+pub fn secure_store(layout: &crate::paths::Layout, manifest: &Manifest) {
+    use std::os::unix::fs::PermissionsExt;
+    for (rel, rec) in &manifest.modes {
+        let path = layout.stored(rel);
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if md.file_type().is_symlink() {
+            continue;
+        }
+        let mode = md.permissions().mode() & 0o7777;
+        let tight = perms::restrict(mode, *rec);
+        if tight != mode {
+            let _ = crate::fsx::chmod(&path, tight);
+        }
     }
 }
 
