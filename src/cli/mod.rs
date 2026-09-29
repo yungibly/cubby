@@ -37,14 +37,16 @@ your home directory, one file at the same relative path for every file you
 track. Version the store with git and you have your dotfiles everywhere.
 
   cubby ~/.zshrc ~/.config/nvim   start tracking (copies home → store)
-  cubby                           save every tracked file that changed
+  cubby                           save what changed at home
   cubby restore                   copy the store back over home
-  cubby status                    see what differs
+  cubby sync                      each change in the direction it was made
+  cubby status                    see what differs, and which side changed
+  cubby undo                      reverse the last run
 
 Directories are tracked as a whole: new files under them are picked up and
 files you delete at home are removed from the store. Files are only ever
-copied, never linked. Anything cubby overwrites or removes is backed up
-first.";
+copied, never linked, and cubby never deletes anything at home. Anything it
+overwrites or removes is backed up first.";
 
 #[derive(Parser)]
 #[command(
@@ -62,7 +64,8 @@ struct Cli {
     #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
     paths: Vec<String>,
 
-    /// Replace files whose kind differs between home and store
+    /// Also replace store copies that changed since the last sync, or that
+    /// hold a different kind of file
     #[arg(long)]
     force: bool,
 
@@ -113,7 +116,9 @@ enum Command {
         /// Files or directories to save; a directory becomes tracked as a whole
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
-        /// Replace files whose kind differs between home and store
+        /// Also replace store copies that changed since the last sync, or
+        /// that hold a different kind of file, and take home's permissions
+        /// as they are
         #[arg(long)]
         force: bool,
         /// Save files that look like secrets without asking
@@ -122,9 +127,11 @@ enum Command {
     },
     /// Copy files from the store back into home (all tracked files, or the given paths)
     Restore {
+        /// Files or directories to restore
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
-        /// Replace files whose kind differs between home and store
+        /// Also replace home copies that changed since the last sync, or
+        /// that hold a different kind of file
         #[arg(long)]
         force: bool,
     },
@@ -134,6 +141,7 @@ enum Command {
     /// changed on both sides are left for you to decide; nothing at home is
     /// ever deleted.
     Sync {
+        /// Files or directories to sync
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
         /// Save files that look like secrets without asking
@@ -142,6 +150,7 @@ enum Command {
     },
     /// Show what differs between home and the store
     Status {
+        /// Only these files or directories
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
         /// Print nothing; exit 0 when up to date, 1 when anything differs, 2 on error
@@ -150,6 +159,7 @@ enum Command {
     },
     /// Show line-by-line differences between home and the store
     Diff {
+        /// Only these files or directories
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
         /// Diff in the restore direction (store as new, home as old)
@@ -169,6 +179,7 @@ enum Command {
     /// Stop tracking files or directories (removes them from the store)
     #[command(visible_alias = "rm")]
     Untrack {
+        /// Tracked files, or tracked directories
         #[arg(value_name = "PATH", required = true, value_hint = clap::ValueHint::AnyPath)]
         paths: Vec<String>,
     },
@@ -178,6 +189,7 @@ enum Command {
     /// with a slash matches a path from home (`~/.config/nvim/lazy-lock.json`).
     /// With no patterns, lists what is ignored.
     Ignore {
+        /// Patterns to add (or with --remove, to take out)
         #[arg(value_name = "PATTERN")]
         patterns: Vec<String>,
         /// Only on this machine: add to `skip` in config.toml, not the store
@@ -203,11 +215,13 @@ enum Command {
     ///
     /// Paths that changed again since that run are left alone.
     Undo {
+        /// A run's id, or the start of one
         #[arg(value_name = "RUN")]
         id: Option<String>,
     },
     /// List the backups of overwritten and removed files, or one path's
     Backups {
+        /// A file whose kept copies to list, newest first
         #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         path: Option<String>,
     },
