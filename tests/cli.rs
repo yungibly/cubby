@@ -1547,6 +1547,41 @@ fn undo_reverses_the_last_run() {
 }
 
 #[test]
+fn undoing_an_undo_puts_the_run_back() {
+    let sb = Sandbox::ready();
+    sb.write_home(".vimrc", "v\n");
+    sb.write_home(".zshrc", "one\n");
+    sb.ok(&["~/.vimrc", "~/.zshrc", "-y"]);
+    sb.write_home(".zshrc", "two\n");
+    sb.ok(&["-y"]);
+    sb.ok(&["undo", "-y"]);
+    assert_eq!(sb.read_store(".zshrc"), "one\n");
+    let history = sb.ok(&["history"]);
+    let undo = history
+        .lines()
+        .find(|l| l.contains("  undo "))
+        .and_then(|l| l.split_whitespace().last())
+        .unwrap()
+        .to_owned();
+    sb.ok(&["undo", &undo, "-y"]);
+    assert_eq!(sb.read_store(".zshrc"), "two\n");
+
+    // The save stands again: history says so, and a plain undo takes it
+    // back rather than reaching for the run before.
+    let history = sb.ok(&["history"]);
+    let save_line = history.lines().rfind(|l| l.contains("  save ")).unwrap();
+    assert!(!save_line.contains("undone"), "{history}");
+    let text = sb.ok(&["undo", "-y"]);
+    assert!(text.contains("put back in the store"), "{text}");
+    assert_eq!(sb.read_store(".zshrc"), "one\n");
+    assert!(sb.store_path(".vimrc").exists());
+
+    // Backups are kept to their owner.
+    let runs = sb.home.join(".local/state/cubby/runs");
+    assert_eq!(mode(&runs), 0o700);
+}
+
+#[test]
 fn backups_are_listed_and_found_by_path() {
     let sb = Sandbox::ready();
     let text = sb.ok(&["backups"]);

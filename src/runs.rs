@@ -178,6 +178,9 @@ impl Run {
         if !self.keep_copies || meta.kind == fsx::Kind::Dir {
             return Ok(false);
         }
+        if let Some(root) = self.dir.parent() {
+            private_dir(root)?;
+        }
         let dest = rel.under(&self.dir.join("backup"));
         fsx::copy_entry(path, meta, &dest, None, &Perms::default())
             .with_context(|| format!("cannot back up {} to {}", path.display(), dest.display()))?;
@@ -205,6 +208,9 @@ impl Run {
             return Ok(());
         }
         let text = toml::to_string(&self.file).context("cannot describe the run")?;
+        if let Some(root) = self.dir.parent() {
+            private_dir(root)?;
+        }
         let path = self.dir.join("run.toml");
         fsx::write_atomic(&path, text.as_bytes())
             .with_context(|| format!("cannot write {}", path.display()))
@@ -263,9 +269,30 @@ pub fn list(state_dir: &Path) -> Vec<Info> {
     runs
 }
 
-/// The ids of runs that an undo has reversed.
+/// The ids of runs that stand reversed: an undo counts only while it has
+/// not been undone itself.
 pub fn undone(runs: &[Info]) -> BTreeSet<String> {
-    runs.iter().filter_map(|r| r.file.undoes.clone()).collect()
+    let mut undone = BTreeSet::new();
+    for r in runs.iter().rev() {
+        if undone.contains(&r.file.id) {
+            continue;
+        }
+        if let Some(of) = &r.file.undoes {
+            undone.insert(of.clone());
+        }
+    }
+    undone
+}
+
+/// Make `dir` and keep it to its owner: it holds copies of dotfiles.
+fn private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        fsx::chmod(dir, mode & 0o700)?;
+    }
+    Ok(())
 }
 
 /// A backup set cubby 2 left in `<state>/backups/`.
@@ -273,6 +300,17 @@ pub struct Legacy {
     pub dir: PathBuf,
     pub name: String,
     pub time: Option<jiff::civil::DateTime>,
+}
+
+impl Legacy {
+    /// The operation a set was made by: `save` in `20260101-120000-save-2`.
+    fn kind(&self) -> &str {
+        let rest = self.name.get(16..).unwrap_or("");
+        match rest.rsplit_once('-') {
+            Some((kind, n)) if n.chars().all(|c| c.is_ascii_digit()) => kind,
+            _ => rest,
+        }
+    }
 }
 
 /// cubby 2's backup sets, oldest first.
@@ -304,9 +342,10 @@ pub fn legacy_sets(state_dir: &Path) -> Vec<Legacy> {
 /// many were removed.
 pub fn prune(state_dir: &Path, days: u32) -> Result<usize> {
     let now = jiff::Timestamp::now();
+    // More days than time goes back means keeping everything.
     let cutoff = now
         .checked_sub(jiff::SignedDuration::from_hours(24 * i64::from(days)))
-        .unwrap_or(now);
+        .unwrap_or(jiff::Timestamp::MIN);
     let mut removed = 0;
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for run in list(state_dir).iter().rev() {
@@ -319,14 +358,16 @@ pub fn prune(state_dir: &Path, days: u32) -> Result<usize> {
         }
     }
     let tz = jiff::tz::TimeZone::system();
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     let legacy = legacy_sets(state_dir);
-    let keep_from = legacy.len().saturating_sub(KEEP_PER_KIND);
-    for (i, set) in legacy.iter().enumerate() {
+    for set in legacy.iter().rev() {
+        let n = seen.entry(set.kind()).or_default();
+        *n += 1;
         let old = set
             .time
             .and_then(|t| t.to_zoned(tz.clone()).ok())
             .is_some_and(|t| t.timestamp() < cutoff);
-        if old && i < keep_from {
+        if old && *n > KEEP_PER_KIND {
             std::fs::remove_dir_all(&set.dir)
                 .with_context(|| format!("cannot remove {}", set.dir.display()))?;
             removed += 1;
@@ -441,13 +482,19 @@ mod tests {
         for i in 1..=7 {
             std::fs::create_dir_all(state.join(format!("backups/2020010{i}-000000-save"))).unwrap();
         }
+        std::fs::create_dir_all(state.join("backups/20200101-000000-restore-2")).unwrap();
 
-        // Of eight saves, the newest five stay; the lone old restore stays.
+        // "Forever" keeps everything.
+        assert_eq!(prune(&state, u32::MAX).unwrap(), 0);
+        // Of eight saves, the newest five stay; the lone old restore stays,
+        // and the same goes for cubby 2's sets.
         assert_eq!(prune(&state, 30).unwrap(), 3 + 2);
         let kinds: Vec<String> = list(&state).into_iter().map(|r| r.file.kind).collect();
         assert_eq!(kinds.iter().filter(|k| *k == "save").count(), 5);
         assert_eq!(kinds.iter().filter(|k| *k == "restore").count(), 1);
-        assert_eq!(legacy_sets(&state).len(), KEEP_PER_KIND);
+        let legacy: Vec<String> = legacy_sets(&state).into_iter().map(|s| s.name).collect();
+        assert_eq!(legacy.len(), KEEP_PER_KIND + 1, "{legacy:?}");
+        assert!(legacy.contains(&"20200101-000000-restore-2".to_owned()));
     }
 
     #[test]
