@@ -15,7 +15,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], allow_secrets: bool) -> Result<i32> 
     };
     let scan = ctx.scanner().scan(&scope)?;
     ctx.learn(&scan, &scope);
-    failures += ctx.report_unstored(&scope, &scan);
+    failures += ctx.report_unstored(&scope, &scan, true);
     let mut plan = plan::sync_plan(&scan, &ctx.cfg.layout, &ctx.manifest.modes);
     failures += plan.troubled();
     let secrets = ctx.mark_secrets(&mut plan);

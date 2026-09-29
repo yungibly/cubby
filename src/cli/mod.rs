@@ -283,13 +283,11 @@ pub struct Ctx {
     lock: LockState,
 }
 
-/// Whether this process may change files and the index.
+/// Whether this process holds the lock that lets it change files. Only
+/// commands that change files take it; the rest never wait for it.
 enum LockState {
+    NotTaken,
     Held(#[allow(dead_code)] Lock),
-    /// Another cubby holds the lock.
-    Busy,
-    /// Let go before paging output, so other commands can run meanwhile.
-    Released,
     /// The state directory cannot be written; carry on without the lock.
     Unavailable,
 }
@@ -304,11 +302,7 @@ impl Ctx {
         let manifest = Manifest::load(&cfg.layout.store)?;
         let ignore = ignore_rules(&cfg, &manifest, &cfg.skip)?;
         let shared = ignore_rules(&cfg, &manifest, &[])?;
-        let lock = match Lock::try_acquire(&cfg.state_dir) {
-            Ok(Some(lock)) => LockState::Held(lock),
-            Ok(None) => LockState::Busy,
-            Err(_) => LockState::Unavailable,
-        };
+        let lock = LockState::NotTaken;
         let mut index = Index::load(&cfg.state_dir, &cfg.layout.store);
         // Upgrading from cubby 2: once, before cubby 3 has kept an index on
         // this machine, and only for what is in this store.
@@ -338,37 +332,44 @@ impl Ctx {
     /// Commands that change files run one at a time. Taking the turn also
     /// tightens store copies of private files that a git checkout left
     /// readable by others.
-    pub fn require_lock(&self) -> Result<()> {
-        if matches!(self.lock, LockState::Busy) && !self.dry_run {
-            bail!(
-                "another cubby is running (it holds {}); try again when it has finished",
-                self.cfg.layout.pretty(&self.cfg.state_dir.join("lock"))
-            );
+    pub fn require_lock(&mut self) -> Result<()> {
+        // A dry run changes nothing, so it needs no turn.
+        if self.dry_run {
+            return Ok(());
         }
-        if !self.dry_run {
-            secure_store(&self.cfg.layout, &self.manifest);
+        if matches!(self.lock, LockState::NotTaken) {
+            self.lock = match Lock::try_acquire(&self.cfg.state_dir) {
+                Ok(Some(lock)) => LockState::Held(lock),
+                Ok(None) => bail!(
+                    "another cubby is running (it holds {}); try again when it has finished",
+                    self.cfg.layout.pretty(&self.cfg.state_dir.join("lock"))
+                ),
+                Err(_) => LockState::Unavailable,
+            };
         }
+        secure_store(&self.cfg.layout, &self.manifest);
         Ok(())
     }
 
-    /// Let other cubby processes run, for a command that is done with the
-    /// index (before paging output, say).
-    pub fn release_lock(&mut self) {
-        self.lock = LockState::Released;
-    }
-
-    fn may_write_index(&self) -> bool {
-        !self.dry_run && matches!(self.lock, LockState::Held(_) | LockState::Unavailable)
-    }
-
     /// Remember what a scan found: baselines for paths that match and
-    /// fingerprints of files that were read. Failing to write the index
-    /// only costs a slower, less precise scan next time, so it is quiet.
+    /// fingerprints of files that were read. A command that does not hold
+    /// the lock takes it just long enough to write, and never waits for it.
+    /// Failing to write the index only costs a slower, less precise scan
+    /// next time, so it is quiet.
     pub fn learn(&mut self, scan: &Scan, scope: &Scope) {
-        if self.may_write_index() {
-            self.index.learn(scan, scope);
-            let _ = self.index.save();
+        if self.dry_run {
+            return;
         }
+        let _turn = match self.lock {
+            LockState::NotTaken => match Lock::try_acquire(&self.cfg.state_dir) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => return,
+                Err(_) => None,
+            },
+            LockState::Held(_) | LockState::Unavailable => None,
+        };
+        self.index.learn(scan, scope);
+        let _ = self.index.save();
     }
 
     /// A scanner that sees what this machine syncs.
@@ -433,20 +434,28 @@ impl Ctx {
         }
     }
 
-    /// Report each named path that has nothing in the store beneath it, or
-    /// that is ignored. Returns how many there were.
-    pub fn report_unstored(&self, scope: &Scope, scan: &Scan) -> usize {
+    /// Report each named path with nothing in the store beneath it (or,
+    /// with `new_ok`, nothing tracked: new files under tracked directories
+    /// count), or that is ignored. Returns how many there were.
+    pub fn report_unstored(&self, scope: &Scope, scan: &Scan, new_ok: bool) -> usize {
         let mut missing = 0;
         for rel in &scope.rels {
+            let tracked = |e: &crate::scan::Entry| {
+                e.store.is_some() || (new_ok && e.dir.is_some() && e.home.is_some())
+            };
             if let Some(reason) = self.ignore.reason(rel) {
                 self.error(&format!("{rel} is ignored: {reason}"));
                 missing += 1;
             } else if !scan
                 .entries
                 .iter()
-                .any(|e| e.rel.is_within(rel) && e.store.is_some())
+                .any(|e| e.rel.is_within(rel) && tracked(e))
             {
-                self.error(&format!("nothing in the store at {rel}"));
+                if new_ok {
+                    self.error(&format!("nothing tracked at {rel}"));
+                } else {
+                    self.error(&format!("nothing in the store at {rel}"));
+                }
                 missing += 1;
             }
         }

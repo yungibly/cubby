@@ -430,7 +430,7 @@ fn status_reports_every_kind_of_difference() {
     );
     assert!(!text.contains("up to date"), "{text}");
     let text = sb.fail(&["diff", "~/.nope"]);
-    assert!(text.contains("nothing in the store at ~/.nope"), "{text}");
+    assert!(text.contains("nothing tracked at ~/.nope"), "{text}");
     let text = sb.ok(&["status", "~/.zshrc"]);
     assert!(!text.contains(".gitconfig"), "{text}");
 }
@@ -1459,6 +1459,46 @@ fn init_can_clone_a_store() {
     assert!(text.contains("already exists and is not empty"), "{text}");
     let text = b.fail(&["init", "~/a", "~/b"]);
     assert!(text.contains("is not a repository URL"), "{text}");
+}
+
+#[test]
+fn looking_never_blocks_changing() {
+    let sb = Sandbox::ready();
+    git(&sb.store, "init -q");
+    sb.write_home(".zshrc", "z\n");
+    // A git command through cubby that is still running (waiting on its
+    // input, as a commit waits on an editor)...
+    let mut waiting = sb_command(&sb, &["git", "hash-object", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // ...does not stop a save.
+    sb.ok(&["~/.zshrc", "-y"]);
+    drop(waiting.stdin.take());
+    assert!(waiting.wait().unwrap().success());
+}
+
+#[test]
+fn naming_a_new_file_in_a_tracked_directory() {
+    let sb = Sandbox::ready();
+    sb.write_home(".config/nvim/init.lua", "a\n");
+    sb.write_home(".config/nvim/lua/p.lua", "p\n");
+    sb.ok(&["~/.config/nvim", "-y"]);
+
+    sb.write_home(".config/nvim/lua/new.lua", "n\n");
+    let text = sb.ok(&["diff", "~/.config/nvim/lua/new.lua"]);
+    assert!(text.contains("+n"), "{text}");
+    sb.ok(&["sync", "~/.config/nvim/lua/new.lua", "-y"]);
+    assert!(sb.store_path(".config/nvim/lua/new.lua").exists());
+
+    // Saving one path still sees the rest of the directory: a deletion is
+    // mirrored, not mistaken for an emptied directory.
+    fs::remove_file(sb.home_path(".config/nvim/init.lua")).unwrap();
+    let text = sb.ok(&["~/.config/nvim/init.lua", "-y"]);
+    assert!(!text.contains("has no files"), "{text}");
+    assert!(text.contains("- .config/nvim/init.lua"), "{text}");
+    assert!(!sb.store_path(".config/nvim/init.lua").exists());
 }
 
 #[test]

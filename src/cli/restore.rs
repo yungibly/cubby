@@ -12,7 +12,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], force: bool) -> Result<i32> {
     };
     let scan = ctx.scanner().scan(&scope)?;
     ctx.learn(&scan, &scope);
-    failures += ctx.report_unstored(&scope, &scan);
+    failures += ctx.report_unstored(&scope, &scan, false);
 
     let plan = plan::plan(
         &scan,

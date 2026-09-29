@@ -15,10 +15,7 @@ pub fn run(ctx: &mut Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Re
     };
     let scan = ctx.scanner().scan(&scope)?;
     ctx.learn(&scan, &scope);
-    // Nothing more to write: let other cubby commands run while the pager
-    // is open.
-    ctx.release_lock();
-    failures += ctx.report_unstored(&scope, &scan);
+    failures += ctx.report_unstored(&scope, &scan, true);
 
     let mut out = String::new();
     let mut shown = 0;

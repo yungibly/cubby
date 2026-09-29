@@ -206,7 +206,9 @@ impl Scanner<'_> {
                 continue;
             }
             let seen = self.walk_home_dir(dir, scope, &mut home_side, &mut notes)?;
-            if seen == 0 && store_side.keys().any(|r| r.is_within(dir)) {
+            // The walk skips parts out of scope, so before calling the
+            // directory empty, make sure nothing is anywhere in it.
+            if seen == 0 && store_side.keys().any(|r| r.is_within(dir)) && !self.holds_files(dir) {
                 empty_dirs.push(dir.clone());
             } else {
                 present_dirs.push(dir.clone());
@@ -401,8 +403,33 @@ impl Scanner<'_> {
         Ok(found)
     }
 
+    /// Whether a tracked directory at home holds any file or symlink that is
+    /// not ignored, at any depth.
+    fn holds_files(&self, dir: &Rel) -> bool {
+        let mut walker = WalkDir::new(self.layout.live(dir))
+            .follow_links(false)
+            .min_depth(1)
+            .into_iter();
+        while let Some(Ok(entry)) = walker.next() {
+            let Ok(rel) = Rel::from_path_under(&self.layout.home, entry.path()) else {
+                continue;
+            };
+            if self.ignore.is_ignored(&rel) {
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Walk a tracked directory at home. Returns how many files and symlinks
-    /// were seen (ignored ones excluded), whether or not they were in scope.
+    /// were seen (ignored ones excluded), in scope or not, in the parts it
+    /// walked: subdirectories out of scope are skipped.
     fn walk_home_dir(
         &self,
         dir: &Rel,
