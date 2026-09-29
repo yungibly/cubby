@@ -494,7 +494,7 @@ fn symlinks_are_copied_as_symlinks() {
     fs::remove_file(sb.home_path(".config/theme.conf")).unwrap();
     std::os::unix::fs::symlink("../real/other.conf", sb.home_path(".config/theme.conf")).unwrap();
     let text = sb.ok(&["diff"]);
-    assert!(text.contains("(symlink)"), "{text}");
+    assert!(text.contains("(changed at home; symlink)"), "{text}");
     assert!(text.contains("- ../real/theme.conf"), "{text}");
     assert!(text.contains("+ ../real/other.conf"), "{text}");
 
@@ -629,7 +629,7 @@ fn diff_shows_unified_output_in_both_directions() {
     sb.write_home(".zshrc", "line one\nline 2\n");
 
     let text = sb.ok(&["diff"]);
-    assert!(text.contains("~/.zshrc"), "{text}");
+    assert!(text.contains("~/.zshrc (changed at home)"), "{text}");
     assert!(text.contains("--- store\n+++ home\n"), "{text}");
     assert!(text.contains("-line two\n+line 2\n"), "{text}");
     let text = sb.ok(&["diff", "-R"]);
@@ -658,6 +658,13 @@ fn diff_shows_unified_output_in_both_directions() {
     sb.write_home(".config/app/a.conf", "a\n");
     sb.ok(&["~/.config/app", "-y"]);
     sb.write_home(".config/app/b.conf", "only at home\n");
+    // Permissions show in the direction that would change them.
+    fs::set_permissions(sb.home_path(".zshrc"), fs::Permissions::from_mode(0o600)).unwrap();
+    let text = sb.ok(&["diff", "~/.zshrc"]);
+    assert!(
+        text.contains("~/.zshrc (permissions: record 600)"),
+        "{text}"
+    );
     let text = sb.ok(&["diff", "-R", "~/.config/app"]);
     assert!(!text.contains("only at home\n"), "{text}");
     assert!(
@@ -1212,7 +1219,7 @@ fn one_cubby_changes_files_at_a_time() {
 fn git_is_watched_but_never_driven() {
     let sb = Sandbox::ready();
     let text = sb.ok(&["status"]);
-    assert!(text.contains("store: not a git repository"), "{text}");
+    assert!(!text.contains("store:"), "no nagging without git: {text}");
     git(&sb.store, "init -q");
     sb.write_home(".zshrc", "z\n");
     sb.ok(&["~/.zshrc", "-y"]);

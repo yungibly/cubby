@@ -742,16 +742,9 @@ impl Ctx {
     /// to push or pull. Forgetting those is how dotfiles fail to follow you.
     pub fn print_git_state(&self) {
         let store = &self.cfg.layout.store;
+        // A store synced some other way is not nagged about; doctor is
+        // where a missing repository is pointed out.
         let Some(g) = crate::git::state(store) else {
-            if !store.join(".git").exists() {
-                // Git missing, or the store not in a repository (or in
-                // one that ignores it).
-                println!(
-                    "{}",
-                    self.style
-                        .dim("store: not a git repository; `cubby git init` versions it")
-                );
-            }
             return;
         };
         let mut parts = Vec::new();

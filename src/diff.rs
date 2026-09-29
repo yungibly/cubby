@@ -7,7 +7,7 @@ use similar::{Algorithm, ChangeTag, TextDiff};
 
 use crate::fsx::{self, Kind};
 use crate::paths::Layout;
-use crate::scan::{Entry, State};
+use crate::scan::{Change, Entry, State};
 use crate::ui::Style;
 
 /// Render the diff for one entry. By default the store copy is "old" and the
@@ -45,27 +45,46 @@ pub fn render(entry: &Entry, layout: &Layout, reverse: bool, style: &Style) -> R
         )
     };
 
+    // Which side changed, from the last sync, heads every entry.
+    let change = match &entry.state {
+        State::Modified(Change::Home) => "changed at home",
+        State::Modified(Change::Store) => "changed in the store",
+        State::Modified(Change::Both) => "changed at home and in the store",
+        State::New { was_stored: false } => "new at home",
+        State::New { was_stored: true } => "deleted from the store",
+        State::Missing {
+            was_here: false, ..
+        } => "new in the store",
+        State::Missing { was_here: true, .. } => "deleted at home",
+        _ => "",
+    };
     let mut out = String::new();
     let heading = |out: &mut String, note: &str| {
         let name = style.bold(&rel.to_string());
+        let note = match (change, note) {
+            ("", "") => String::new(),
+            ("", n) => format!("({n})"),
+            (c, "") => format!("({c})"),
+            (c, n) => format!("({c}; {n})"),
+        };
         let _ = if note.is_empty() {
             writeln!(out, "{name}")
         } else {
-            writeln!(out, "{name} {}", style.dim(note))
+            writeln!(out, "{name} {}", style.dim(&note))
         };
     };
 
     match &entry.state {
         State::Same => return Ok(String::new()),
         State::Error(msg) => {
-            heading(&mut out, &format!("(error: {msg})"));
+            heading(&mut out, &format!("error: {msg}"));
             return Ok(out);
         }
         State::Conflict { home, store } => {
             heading(
                 &mut out,
                 &format!(
-                    "(home has {}, store has {})",
+                    "home has {}, store has {}",
                     home.describe(),
                     store.describe()
                 ),
@@ -82,7 +101,7 @@ pub fn render(entry: &Entry, layout: &Layout, reverse: bool, style: &Style) -> R
                 .map(|t| t.display().to_string())
                 .unwrap_or_else(|| "(absent)".into())
         };
-        heading(&mut out, "(symlink)");
+        heading(&mut out, "symlink");
         let _ = writeln!(out, "{}", style.red(&format!("- {}", show(old_meta))));
         let _ = writeln!(out, "{}", style.green(&format!("+ {}", show(new_meta))));
         return Ok(out);
@@ -91,7 +110,7 @@ pub fn render(entry: &Entry, layout: &Layout, reverse: bool, style: &Style) -> R
     let old_binary = old_meta.is_some() && fsx::looks_binary(old_path);
     let new_binary = new_meta.is_some() && fsx::looks_binary(new_path);
     if old_binary || new_binary {
-        heading(&mut out, "(binary files differ)");
+        heading(&mut out, "binary files differ");
         return Ok(out);
     }
 

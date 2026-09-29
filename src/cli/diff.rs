@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use super::Ctx;
+use crate::perms;
 use crate::scan::State;
 use crate::ui;
 
@@ -53,6 +54,35 @@ pub fn run(ctx: &mut Ctx, paths: &[String], reverse: bool, no_pager: bool) -> Re
             out.push('\n');
         }
         out.push_str(&text);
+        shown += 1;
+    }
+    // Permissions that command would change.
+    for p in &scan.perms {
+        let what = match (reverse, p.needs_record(), p.needs_chmod()) {
+            (false, true, _) => match p.record {
+                Some(m) => format!("permissions: record {}", perms::show(m)),
+                None => "permissions: forget the record".to_owned(),
+            },
+            (true, _, true) => format!(
+                "permissions: {} → {}",
+                perms::show(p.home),
+                perms::show(p.restored)
+            ),
+            _ => continue,
+        };
+        if shown > 0 {
+            out.push('\n');
+        }
+        let path = if p.is_dir {
+            format!("{}/", p.rel)
+        } else {
+            p.rel.to_string()
+        };
+        out.push_str(&format!(
+            "{} {}\n",
+            ctx.style.bold(&path),
+            ctx.style.dim(&format!("({what})"))
+        ));
         shown += 1;
     }
     for n in &scan.notes {
